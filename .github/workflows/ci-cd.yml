@@ -166,12 +166,12 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          # --set-env-vars / --set-secrets は既存の設定を置きかえる（ワークフローの内容が常に正）
+          # --set-env-vars は既存の設定を置きかえる（ワークフローの内容が常に正）
           ENV_VARS="DB_BACKEND=mysql,MYSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION_NAME},MYSQL_USER=${MYSQL_USER},MYSQL_DATABASE=${MYSQL_DATABASE},UPLOAD_BACKEND=gcs,GCS_UPLOAD_BUCKET=${UPLOADS_BUCKET}"
           [ -n "$GEMINI_MODEL" ] && ENV_VARS="${ENV_VARS},GEMINI_MODEL=${GEMINI_MODEL}"
-          SECRETS="MYSQL_PASSWORD=${MYSQL_PASSWORD_SECRET}:latest"
-          # Gemini のキーは任意。シークレット名の Variable があるときだけ渡す（無ければモックで動く）
-          [ -n "$GEMINI_API_KEY_SECRET" ] && SECRETS="${SECRETS},GEMINI_API_KEY=${GEMINI_API_KEY_SECRET}:latest"
+          # シークレットの紐付けは Terraform がサービス側で管理する。
+          # --set-secrets を付けると gcloud が Terraform 作成サービスの参照形式で
+          # クラッシュするため、ここでは指定しない（2026-11-22 の初回デプロイで確認）。
           SA_FLAG=()
           [ -n "$CLOUD_RUN_RUNTIME_SA" ] && SA_FLAG=(--service-account "$CLOUD_RUN_RUNTIME_SA")
 
@@ -181,7 +181,6 @@ jobs:
             --image "$IMAGE" \
             --port 8000 \
             --set-env-vars "$ENV_VARS" \
-            --set-secrets "$SECRETS" \
             --add-cloudsql-instances "$CLOUDSQL_CONNECTION_NAME" \
             --min-instances 0 \
             --allow-unauthenticated \
@@ -319,3 +318,4 @@ jobs:
             --project "$GCP_PROJECT_ID" \
             --region "$GCP_REGION" \
             --wait
+            
