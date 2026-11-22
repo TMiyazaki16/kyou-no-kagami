@@ -6,9 +6,9 @@
 
 家族の体調の変化に、**本人が**気づくためのアプリ。中心は本人の自己認知で、AI は本人の言葉を映す「鏡」として気づきを本人に返す。家族への共有は、本人が選んだときだけ使う「出口」（opt-in）であって、家族が見守るためのアプリではない。
 
-- バックエンド: FastAPI（Python 3.10 以上）＋ SQLite。AI は Gemini API（未設定ならローカルモック）
+- バックエンド: FastAPI（Python 3.10 以上）＋ SQLite（ローカル・テスト）／ Cloud SQL for MySQL（本番方針、`DB_BACKEND=mysql`）。AI は Gemini API（未設定ならローカルモック）
 - フロントエンド: React + TypeScript / Vite。全10画面（従来の9画面＋「設定・家族」）と、未ログイン時のログイン/登録画面
-- アカウント制（メール＋パスワード、2026-11-22 にオーナー決定で固定2名の切替から移行）。家族とは家族コードで連携する。GCP 連携（Firestore / Cloud Run / Cloud Storage）はまだない
+- アカウント制（メール＋パスワード、2026-11-22 にオーナー決定で固定2名の切替から移行）。家族とは家族コードで連携する。GCP 連携（Cloud Run / Cloud Storage のリソース作成）とデプロイはまだない。MySQL 版 Store と Cloud Storage 版のアップロード保存先は実装済みだが、どちらも実機では未検証
 - git 管理外。大きく書き換える前に `/tmp` へバックアップを取る
 
 設計方針・手順・制約は `README.md` を正とする。ここに書いていないことは README の該当節を読む。
@@ -31,11 +31,15 @@
 backend/
   app/main.py         FastAPI のエンドポイント。認証（current_user）・日付の決定（JST）・アップロード検証・所有者と連携の権限
   app/auth.py         パスワードハッシュ（PBKDF2）・トークン・家族コード・デモアカウントと旧データの移行
-  app/storage.py      保存層。Store インターフェースと SQLiteStore 実装
+  app/storage.py      保存層。Store インターフェースと SQLiteStore 実装、DB_BACKEND で選ぶ create_store()
+  app/storage_mysql.py  MySQLStore（Cloud SQL for MySQL。PyMySQL は DB_BACKEND=mysql のときだけ import）
+  app/uploads.py      写真・音声の保存先（ローカル / Cloud Storage、UPLOAD_BACKEND で選ぶ）と /uploads の配信。MIME 許可リストもここ
   app/analysis.py     日次解析。Gemini / モックの切替と、Gemini 出力の後段ガード
   app/rules.py        変化への気づきルール（観察文を返す）
   scripts/seed_demo.py  デモデータ投入
   tests/test_api.py   TestClient による検証（unittest）
+  tests/test_mysql_store.py  MySQLStore の検証（オフライン検査は常時、実機検査は KAGAMI_TEST_MYSQL=1 のときだけ）
+  tests/test_uploads.py  保存先の切替の検証（GCS はフェイクの Client。実機は使わない）
 frontend/src/
   App.tsx             全10画面＋ログイン/登録
   api.ts              API クライアントと型。トークンを localStorage に置き Authorization ヘッダーで送る
@@ -65,7 +69,9 @@ frontend/src/
 - 起動時（`main.py` の import 時）に `auth.migrate_legacy_users` が、`mother` / `daughter` のデータがあってアカウントがないときだけデモアカウントを作り、連携する。旧データのない新しいDBでは何もしない
 - `seed_demo.py` は `auth.ensure_demo_accounts` で2アカウントを作って連携してから投入する
 
-- `storage.py` — 永続化はすべて `Store` を経由する。Firestore 等への移行は、同じメソッドを持つクラスを作って `main.py` の `store` を差し替えるだけで済むようにしておく。`main.py` から SQL を直接書かない。アカウント・セッション・家族連携も `Store` のメソッド（`create_user` / `create_session` / `add_family_link` など）を通す。記録は1ユーザー1日1件で、同じ日の2回目は `upsert_record` で上書きする。既存DBに足りない列は起動時に `ALTER TABLE` で追加する（`_ANALYSIS_EXTRA_COLUMNS`）
+- `storage.py` — 永続化はすべて `Store` を経由する。実装の選択は `storage.create_store()`（`DB_BACKEND=mysql` → `MySQLStore`、それ以外 → `SQLiteStore`）。Store にメソッドを足すときは `SQLiteStore` と `MySQLStore` の両方に実装する（`test_mysql_store` がメソッドの一致を検査する）。`main.py` から SQL を直接書かない。アカウント・セッション・家族連携も `Store` のメソッド（`create_user` / `create_session` / `add_family_link` など）を通す。記録は1ユーザー1日1件で、同じ日の2回目は `upsert_record` で上書きする。既存DBに足りない列は起動時に `ALTER TABLE` で追加する（`_ANALYSIS_EXTRA_COLUMNS`。MySQL は `storage_mysql._MYSQL_ANALYSIS_EXTRA_COLUMNS` にも足す）
+- `storage_mysql.py` — MySQL の方言：プレースホルダは `%s`（SQL にリテラルの `%` を書かない）、`BIGINT AUTO_INCREMENT`、索引・一意の列は VARCHAR、TEXT にリテラル DEFAULT を付けない（値はアプリが渡す）、`utf8mb4` / `utf8mb4_bin`（SQLite と同じバイナリ照合）。日時は DATETIME にせずタイムゾーン付き ISO 文字列（`main._parse_ts` が前提にしている）。記録は `(user_id, date)` に UNIQUE を付けて `INSERT ... ON DUPLICATE KEY UPDATE` で upsert。重複判定は INSERT IGNORE ではなくエラー 1062 を捕まえる。スキーマは `CREATE TABLE IF NOT EXISTS` で冪等。接続情報（特にパスワード）をログ・例外メッセージ・repr に出さない
+- `uploads.py` — アップロードの読み書き・削除・配信はすべて `main.upload_storage`（`uploads.create_upload_storage()`）を通す。`main.py` で `open()` や GCS を直接触らない。`UPLOAD_BACKEND=gcs` → `GCSUploadStorage`（バケット `GCS_UPLOAD_BUCKET` 直下、記録の参照は `gs://<bucket>/<uuid>.<ext>`）、それ以外 → `LocalUploadStorage`（`APP_UPLOAD_DIR`、参照は絶対パス）。公開URLはどちらも `/uploads/<basename>`（`uploads.public_url`）で、API にバケット名・`gs://`・実パスを出さない。配信はローカルが StaticFiles、GCS はバックエンドが読んで返すプロキシ（署名付き URL にしない＝認証なし・uuid 名という既存の性質を保つ）。GCS 配信は uuid 形式の名前だけ受け付け、Content-Type は拡張子から決める。`google-cloud-storage` は GCS 選択時だけ import（ローカルでは未インストールでも動く）。認証は ADC（Cloud Run のサービスアカウント、権限はバケットに `roles/storage.objectAdmin` 相当）で、鍵ファイルは使わない・リポジトリに置かない
 - `analysis.py` — `GEMINI_API_KEY` があれば Gemini、なければ決定的なモック。Gemini の失敗はモックに落とし、理由を `fallback_reason`（`no_api_key` / `gemini_error` / `guard_*`）に残す。「仕組みを見る」画面がこれを表示する。Gemini の出力はそのまま使わず、`_apply_guards` で検査する：NG語、引用チェック、ベースライン中の変化への言及（引用部分を除いて検査）、ベースライン中の観察文差し替え、定型文の付与。ガードを緩める変更は、審査で「AIは診断しない」を説明できなくなるので相談する
 - `rules.py` — Python だけで書いた3ルール（回答が短い日が続く／感謝欄が空の日／「眠い」等のことばが続く）。出力は判定ではなく観察文。病名や助言は書かず、配慮が必要な文脈では `care_context=True` を返すだけにする（定型文は `analysis.py` が付ける）
 - `scripts/seed_demo.py` — デモアカウント（母さん・娘さん、連携済み）を作り、10日分を、最終日（既定は JST の今日）からさかのぼって投入する。母は1〜7日目が安定、8〜10日目は「元気だけど眠い」で回答が短くなる。9日目に2ルール、10日目に3ルールが発動する。解析はモックで行う
@@ -95,11 +101,29 @@ npm run dev     # http://localhost:5173（/api と /uploads は 8000 番へプ�
 - データは `backend/data/app.db`、アップロードは `backend/data/uploads/`（`APP_DB_PATH` / `APP_UPLOAD_DIR` で変更可）
 - 日付はサーバーが `Asia/Tokyo` で決める。フロントから日付を送らない。表示用にフロントで日付を組み立てるときは `toISOString()`（UTC）を使わず、ローカル時刻から作る
 
+### Docker（デモ用。上のベタ起動はそのまま使える）
+
+```sh
+docker compose up --build    # app/ 直下で。http://localhost:5173
+docker compose exec backend python scripts/seed_demo.py --reset --with-letter   # デモデータ
+
+DB_BACKEND=mysql docker compose --profile mysql up --build   # mysql:8 を使う（既定の up は SQLite のまま）
+docker compose exec backend python scripts/seed_demo.py --reset --confirm-mysql-reset kagami --with-letter
+```
+
+- `backend`（`backend/Dockerfile`、python:3.12-slim、uvicorn :8000）と `frontend`（`frontend/Dockerfile`、node:20-alpine でビルド → nginx:alpine。`frontend/nginx.conf` が `/api/`・`/uploads/` を `http://backend:8000` へプロキシ）。公開ポートは 5173 だけ
+- データは名前付きボリューム `kagami-data`（`/app/data`、`APP_DB_PATH=/app/data/app.db`、`APP_UPLOAD_DIR=/app/data/uploads`）。ホストの `backend/data` とは別。**このボリュームはデモ専用**なので、コンテナ内での `seed_demo.py --reset` は手元データを消す禁止事項に当たらない（ホストの `data/app.db` には今までどおり実行しない）
+- `GEMINI_API_KEY` / `GEMINI_MODEL` はホストの環境変数から引き継ぐ（未設定ならモック）。キーを `docker-compose.yml` やイメージに書き込まない
+- `mysql` サービス（`mysql:8`、`profiles: [mysql]`、ボリューム `kagami-mysql`、ポート非公開）はローカル検証専用。パスワードは compose 内のローカル用既定値で、本番の値は書かない。`seed_demo.py` の MySQL での `--reset` は全テーブルを空にするため `--confirm-mysql-reset <DB名>` が必須（`--db` は SQLite 専用）
+- nginx の `client_max_body_size` はアップロード上限（写真 10MB・音声 5MB）に合わせて 20m にしてある。`MAX_BYTES` を上げるときはここも直す
+
 ### 検証
 
 ```sh
 cd backend && .venv/bin/python -m unittest discover -s tests -v   # pytest は入っていない
 cd frontend && npm run build                                      # tsc の型チェック込み
+# MySQL 実機（検証専用DBの全テーブルを空にする）
+cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=kagami_test .venv/bin/python -m unittest tests.test_mysql_store -v
 ```
 
 テストは日付（`main.today_jst`）を固定し、Gemini 呼び出し（`analysis._call_gemini`）を差し替えて動かす。実キーは使わない。各テストは母・娘のアカウントを API で登録・連携し、認証済みの `TestClient`（`self.c` = 母、`self.d` = 娘、`self.anon` = 未ログイン）で呼ぶ。速度のため `auth.PBKDF2_ITERATIONS` を 1000 に下げている（既定値は `TestAuth` で確認）。
@@ -111,12 +135,20 @@ cd frontend && npm run build                                      # tsc の型�
 | `GEMINI_API_KEY` | 設定すると Gemini を使う。未設定ならモック。キーは `x-goog-api-key` ヘッダーで送り、エラー文では伏せ字にする |
 | `GEMINI_MODEL` | モデル名。既定は `gemini-3.8-flash` |
 | `APP_DB_PATH` / `APP_UPLOAD_DIR` | SQLite とアップロードの置き場所 |
+| `DB_BACKEND` | `mysql` で MySQL（Cloud SQL）、それ以外・未設定は SQLite |
+| `MYSQL_HOST` / `MYSQL_PORT` | `/` で始まれば Unix ソケット（Cloud Run は `/cloudsql/<PROJECT>:<REGION>:<INSTANCE>`）、それ以外は TCP（ポート既定 3306） |
+| `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | 接続情報。Cloud Run では環境変数で渡し、パスワードは Secret Manager から。値をログ・ファイルに出さない |
+| `MYSQL_CONNECT_WAIT_SEC` | 起動時に MySQL の準備を待つ秒数（既定 30。認証エラーは待たない） |
+| `UPLOAD_BACKEND` | `gcs` で写真・音声を Cloud Storage に保存、それ以外・未設定はローカル（`APP_UPLOAD_DIR`） |
+| `GCS_UPLOAD_BUCKET` | `UPLOAD_BACKEND=gcs` のときのバケット名（必須。空なら起動時にエラー）。公開アクセス防止を有効にしたバケットを使う |
 
 ### 既知の未確認事項
 
 - **実キーでの生成成功は未確認**。旧既定の `gemini-2.0-flash` は 2026-11-22 の実地確認で生成 API が 404（"no longer available"）を返した（`gemini-2.5-flash` も新規利用不可）ため、既定を `gemini-3.8-flash` に変更した。`gemini-3.8-flash` は存在するが、同日は 503（high demand）が継続し、生成の成功確認は未了。提出前に確かめる。使えなければ毎回モックに落ち、「仕組みを見る」に Gemini エラーと出る
+- **MySQL 版 Store は実機未検証**（2026-11-22 時点。この環境に MySQL / Docker が無かった）。オフライン検査（メソッド一致・プレースホルダ数・接続設定）だけ通っている。提出前に `docker compose --profile mysql` か Cloud SQL で `tests.test_mysql_store` の実機検査を通す
 - **Chrome の録音形式 `audio/webm` を Gemini が文字起こしできるかは未確認**（公式の対応形式一覧に載っていない）。断られたときは、文字の入力があれば文字だけで再試行する
-- `/uploads` は認証なしの静的配信のまま（ファイル名は uuid）。`<img>` / `<audio>` は Authorization ヘッダーを送れないため、アカウント制にしても残っている。本番では所有者を確認する配信か、署名付き URL が必要
+- **Cloud Storage 版のアップロード保存先は実機未検証**（2026-11-22 時点）。フェイクの Client で保存・配信・削除・解析時の読み込みの分岐だけを `tests/test_uploads.py` で検証している。提出前に実バケットと Cloud Run のサービスアカウントで、保存→`/uploads` での表示・再生（Safari の `<audio>` の Range を含む）→上書き時の削除を確かめる
+- `/uploads` は認証なしの配信のまま（ファイル名は uuid。GCS 版のプロキシも同じ）。`<img>` / `<audio>` は Authorization ヘッダーを送れないため、アカウント制にしても残っている。本番では所有者を確認する配信か、署名付き URL が必要
 - アカウントまわりの範囲外（未実装）：パスワード再設定、メールアドレスの確認、ログイン試行回数の制限、アカウント削除、表示名・パスワードの変更、期限切れセッションの一括掃除（期限切れは使われたときに消す）
 
 ## AI開発ルール

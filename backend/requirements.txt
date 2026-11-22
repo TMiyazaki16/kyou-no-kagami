@@ -2,3 +2,8 @@ fastapi
 uvicorn
 python-multipart
 httpx
+# 本番（DB_BACKEND=mysql / Cloud SQL）用。SQLite だけで動かすときは import されない。
+# [rsa] は TCP 接続で MySQL 8 の caching_sha2_password 認証に必要な cryptography を入れる
+PyMySQL[rsa]
+# 本番（UPLOAD_BACKEND=gcs / Cloud Storage）用。ローカル保存のときは import されない（未インストールでも動く）
+google-cloud-storage

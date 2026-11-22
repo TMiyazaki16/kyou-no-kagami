@@ -1,0 +1,11 @@
+# docker-compose.yml のビルドコンテキストは ./backend と ./frontend（それぞれの .dockerignore が効く）。
+# これはリポジトリ直下をコンテキストにしてビルドした場合の保険。
+.git
+**/.venv
+**/node_modules
+**/dist
+**/data
+**/__pycache__
+**/*.pyc
+**/tsconfig.tsbuildinfo
+.DS_Store

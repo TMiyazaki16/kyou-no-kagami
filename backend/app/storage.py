@@ -1,9 +1,13 @@
 """Storage layer.
 
-All persistence goes through `Store`. The current implementation is
-`SQLiteStore` (local file). To move to Firestore / Cloud SQL later, implement
-the same methods in a new class and swap the instance in `main.py` — no API
-or frontend changes needed.
+All persistence goes through `Store`. Implementations:
+- `SQLiteStore` (local file) — local development and tests (default)
+- `MySQLStore` (`storage_mysql.py`) — production on Cloud SQL for MySQL
+
+`create_store()` picks one from the `DB_BACKEND` environment variable
+(`mysql` → MySQL, anything else → SQLite). To add another backend (e.g.
+Firestore), implement the same methods in a new class — no API or frontend
+changes needed.
 """
 from __future__ import annotations
 
@@ -461,7 +465,16 @@ class SQLiteStore(Store):
         return [dict(r) for r in rows]
 
 
-def _analysis_row(row: sqlite3.Row) -> dict:
+def create_store() -> Store:
+    """DB_BACKEND=mysql なら MySQLStore（MYSQL_* で接続）、それ以外は SQLiteStore（APP_DB_PATH）。"""
+    if os.environ.get("DB_BACKEND", "").strip().lower() == "mysql":
+        from .storage_mysql import MySQLStore  # PyMySQL はこのときだけ import する
+        return MySQLStore()
+    return SQLiteStore()
+
+
+def _analysis_row(row) -> dict:
+    """sqlite3.Row / dict（MySQL の DictCursor）のどちらでも受け付ける。"""
     d = dict(row)
     d["observations"] = json.loads(d.get("observations") or "[]")
     d["request"] = json.loads(d.pop("request_json") or "{}")

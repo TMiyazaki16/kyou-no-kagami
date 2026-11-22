@@ -5,26 +5,27 @@ Run:  uvicorn app.main:app --reload --port 8000
 from __future__ import annotations
 
 import os
-import uuid
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import analysis as analysis_mod
 from . import auth
-from .storage import DuplicateError, SQLiteStore, Store
+from . import uploads
+from .storage import DuplicateError, Store, create_store
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.environ.get("APP_UPLOAD_DIR") or os.path.join(BASE_DIR, "..", "data", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# UPLOAD_BACKEND=gcs なら Cloud Storage（GCS_UPLOAD_BUCKET）、それ以外は UPLOAD_DIR（uploads.create_upload_storage）
+upload_storage: uploads.UploadStorage = uploads.create_upload_storage(UPLOAD_DIR)
 
 JST = ZoneInfo("Asia/Tokyo")
 
-store: Store = SQLiteStore()
+# DB_BACKEND=mysql なら Cloud SQL（MySQL）、それ以外は SQLite（storage.create_store）
+store: Store = create_store()
 # 旧版（固定ユーザー mother / daughter）のデータがあれば、デモアカウントに引き継ぐ
 auth.migrate_legacy_users(store)
 
@@ -35,15 +36,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# /uploads/<名前>：ローカルは StaticFiles、GCS はバックエンドが読んで返すプロキシ（どちらも認証なし・uuid 名）
+upload_storage.mount(app)
 
 STAMPS = ["ありがとう", "うれしい", "元気そうで安心", "電話するね", "また聞かせて"]
 
 PLACEHOLDER_DRAFT = "（AI下書きはまだありません。記録すると、ここに下書きができます）"
 
-# H-6: MIME 許可リストから拡張子を決める（利用者のファイル名は使わない）
-PHOTO_MIMES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-AUDIO_MIMES = {"audio/webm": ".webm", "audio/mp4": ".m4a", "audio/ogg": ".ogg"}
+# H-6: MIME 許可リストから拡張子を決める（利用者のファイル名は使わない。定義は uploads.py）
+PHOTO_MIMES = uploads.PHOTO_MIMES
+AUDIO_MIMES = uploads.AUDIO_MIMES
 EXT_TO_AUDIO_MIME = {ext: mime for mime, ext in AUDIO_MIMES.items()}
 MAX_BYTES = {"photo": 10 * 1024 * 1024, "audio": 5 * 1024 * 1024}
 
@@ -109,7 +111,7 @@ def _public_record(rec: dict) -> dict:
     rec = dict(rec)
     for key in ("audio_path", "photo_path"):
         path = rec.pop(key, None)
-        rec[key.replace("_path", "_url")] = f"/uploads/{os.path.basename(path)}" if path else None
+        rec[key.replace("_path", "_url")] = uploads.public_url(path)
     return rec
 
 
@@ -117,7 +119,7 @@ def _base_mime(content_type: str | None) -> str:
     return (content_type or "").split(";")[0].strip().lower()
 
 
-async def _read_upload(kind: str, upload: UploadFile) -> tuple[bytes, str]:
+async def _read_upload(kind: str, upload: UploadFile) -> tuple[bytes, str, str]:
     allowed = PHOTO_MIMES if kind == "photo" else AUDIO_MIMES
     mime = _base_mime(upload.content_type)
     if mime not in allowed:
@@ -129,18 +131,12 @@ async def _read_upload(kind: str, upload: UploadFile) -> tuple[bytes, str]:
         raise HTTPException(413, f"{kind}: ファイルが大きすぎます（上限 {limit // (1024 * 1024)}MB）")
     if not data:
         raise HTTPException(400, f"{kind}: ファイルが空です")
-    return data, allowed[mime]
+    return data, allowed[mime], mime
 
 
 def _remove_file(path: str | None) -> None:
-    if not path:
-        return
-    try:
-        real = os.path.realpath(path)
-        if real.startswith(os.path.realpath(UPLOAD_DIR) + os.sep) and os.path.isfile(real):
-            os.remove(real)
-    except OSError:
-        pass
+    """保存先（ローカルの UPLOAD_DIR 配下／自分のバケット）のファイルだけを消す。"""
+    upload_storage.delete(path)
 
 
 # --------------------------------------------------------------------------
@@ -261,7 +257,7 @@ async def create_record(
 ):
     """1ユーザー1日1件（M-2）。同じ日の2回目は上書きする。日付はサーバーで決める（H-7）。"""
     # 先に全部検証してから書き込む（片方だけ保存される事故を防ぐ）
-    pending: dict[str, tuple[bytes, str]] = {}
+    pending: dict[str, tuple[bytes, str, str]] = {}
     for kind, upload in (("audio", audio), ("photo", photo)):
         if upload is not None and (upload.filename or upload.size):
             pending[kind] = await _read_upload(kind, upload)
@@ -280,11 +276,20 @@ async def create_record(
     new_transcript = transcript.strip()
     if "audio" not in pending and prev and not new_transcript:
         new_transcript = prev.get("transcript") or ""
-    for kind, (data, ext) in pending.items():
-        path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}{ext}")
-        with open(path, "wb") as f:
-            f.write(data)
-        saved[f"{kind}_path"] = path
+    written: list[str] = []
+    for kind, (data, ext, mime) in pending.items():
+        try:
+            ref = upload_storage.save(uploads.new_name(ext), data, mime)
+        except Exception as e:  # noqa: BLE001
+            if upload_storage.backend != "gcs":
+                raise  # ローカルディスクの失敗は従来どおり
+            # GCS の失敗：途中まで書いたものを片付けて 503（記録は保存しない）
+            for w in written:
+                upload_storage.delete(w)
+            uploads.log.warning("upload save failed: %s", type(e).__name__)
+            raise HTTPException(503, "写真・声を保存できませんでした。少し時間をおいて、もう一度保存してください") from None
+        written.append(ref)
+        saved[f"{kind}_path"] = ref
 
     rec, old = store.upsert_record({
         "user_id": user_id, "date": today, "gratitude": gratitude.strip(),
@@ -359,11 +364,11 @@ def run_analysis(rec: dict) -> dict:
     history = [r for r in store.list_records(user_id) if r["date"] <= rec["date"]]
     audio = None
     path = rec.get("audio_path")
-    if path and os.path.isfile(path):
-        mime = EXT_TO_AUDIO_MIME.get(os.path.splitext(path)[1].lower())
-        if mime:
-            with open(path, "rb") as f:
-                audio = (f.read(), mime)
+    mime = EXT_TO_AUDIO_MIME.get(os.path.splitext(path)[1].lower()) if path else None
+    if mime:
+        data = upload_storage.read(path)
+        if data is not None:
+            audio = (data, mime)
     result = analysis_mod.analyze(rec, baseline_day, previous, history, audio)
     if result.get("transcript") and not (rec.get("transcript") or "").strip():
         store.update_record(rec["id"], {"transcript": result["transcript"]})

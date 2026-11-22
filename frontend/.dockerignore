@@ -1,0 +1,7 @@
+node_modules
+dist
+# tsc -b の増分情報。持ち込むとコンテナ内の型チェックが省略されうる
+tsconfig.tsbuildinfo
+.DS_Store
+Dockerfile
+.dockerignore

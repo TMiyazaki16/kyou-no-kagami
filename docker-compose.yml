@@ -1,0 +1,64 @@
+# きょうのかがみ Docker 構成（デモ用）
+#   docker compose up --build  → http://localhost:5173（SQLite。従来どおり）
+# データは名前付きボリューム kagami-data（ホストの backend/data とは別。デモ専用）
+#
+# MySQL（Cloud SQL 相当）でのローカル検証:
+#   DB_BACKEND=mysql docker compose --profile mysql up --build
+#   docker compose exec backend python scripts/seed_demo.py --reset --confirm-mysql-reset kagami --with-letter
+# （--profile mysql を付けずに DB_BACKEND=mysql だけ指定すると、backend は接続待ちのあと起動に失敗する）
+# MySQL のデータはボリューム kagami-mysql（ローカル検証専用。パスワードは下の既定値で、外部ポートは公開しない）
+services:
+  backend:
+    build: ./backend
+    environment:
+      # ホストに設定があれば引き継ぐ。未設定なら空 → モック／既定モデル
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      # 既定は SQLite。DB_BACKEND=mysql を付けて --profile mysql で起動すると下の mysql サービスを使う
+      DB_BACKEND: ${DB_BACKEND:-sqlite}
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-kagami}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kagami-local-only}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kagami}
+      # mysql コンテナの初回初期化は時間がかかるので、起動時の接続待ちを長めにする
+      MYSQL_CONNECT_WAIT_SEC: ${MYSQL_CONNECT_WAIT_SEC:-90}
+      # 写真・音声の保存先。既定はローカル（下の kagami-data ボリュームの /app/data/uploads）
+      # Cloud Storage を使う場合の例（本番は Cloud Run の環境変数で渡す。認証は ADC＝サービスアカウントで、鍵ファイルは使わない）:
+      #   UPLOAD_BACKEND: gcs
+      #   GCS_UPLOAD_BUCKET: <バケット名>
+      # ローカルの compose から GCS を試すときは、ホストで `gcloud auth application-default login` した ADC を
+      # 読み取り専用でマウントし、GOOGLE_APPLICATION_CREDENTIALS でその場所を指す（認証情報をイメージに入れない）:
+      #   GOOGLE_APPLICATION_CREDENTIALS: /gcloud/application_default_credentials.json
+      #   （volumes に - ~/.config/gcloud:/gcloud:ro を追加）
+      UPLOAD_BACKEND: ${UPLOAD_BACKEND:-local}
+      GCS_UPLOAD_BUCKET: ${GCS_UPLOAD_BUCKET:-}
+    volumes:
+      - kagami-data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # ローカル検証用 MySQL 8（--profile mysql のときだけ起動する）
+  mysql:
+    image: mysql:8
+    profiles: ["mysql"]
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-kagami-local-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-kagami}
+      MYSQL_USER: ${MYSQL_USER:-kagami}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kagami-local-only}
+    volumes:
+      - kagami-mysql:/var/lib/mysql
+    restart: unless-stopped
+
+volumes:
+  kagami-data:
+  kagami-mysql:
