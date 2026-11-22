@@ -1,0 +1,321 @@
+# きょうのかがみ CI/CD
+#
+# CI（push / pull_request / 手動実行）:
+#   backend-sqlite … unittest 全体（SQLite）
+#   backend-mysql  … mysql:8 サービスに対して tests/test_mysql_store.py（KAGAMI_TEST_MYSQL=1 の実機検査を含む）
+#   frontend       … npm ci && npm run build（tsc の型チェック込み）
+#
+# CD（main への push、または main での手動実行のときだけ。CI の全ジョブ成功後）:
+#   deploy-backend  … イメージを Artifact Registry へ push → Cloud Run へデプロイ（Cloud SQL / Secret Manager / GCS）
+#   deploy-frontend … dist をフロント用バケットへ同期
+#   seed-demo       … 手動実行で seed_demo=true のときだけ。Cloud Run Jobs で seed_demo.py を実行（DB を全消去して投入）
+#
+# GCP の識別子・リソース名はすべてリポジトリの Variables（vars.*）から読む。値は Terraform の outputs を登録する。
+# 秘密情報はワークフローに書かない（DB パスワードは Secret Manager のシークレット名だけを渡し、Cloud Run が実行時に読む）。
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seed_demo:
+        description: "デモデータを投入する（Cloud SQL の全テーブルを空にしてから投入。公開デモ環境専用）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- CI
+  backend-sqlite:
+    name: backend (SQLite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12" # backend/Dockerfile と揃える
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Unit tests (SQLite)
+        # KAGAMI_TEST_MYSQL を設定しないので、MySQL 実機検査はスキップされる（オフライン検査は実行）
+        run: python -m unittest discover -s tests -v
+
+  backend-mysql:
+    name: backend (MySQL 8)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        # CI のコンテナ内だけで使う使い捨ての値（秘密ではない）。ポートはランナーのローカルにだけ公開する
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+          MYSQL_DATABASE: kagami_test
+          MYSQL_USER: kagami
+          MYSQL_PASSWORD: ci-local-only
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root-only"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # tests/test_mysql_store.py の TestMySQLLive が読む値（README の検証手順と同じ名前・DB 名）
+      KAGAMI_TEST_MYSQL: "1"
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "3306"
+      MYSQL_USER: kagami
+      MYSQL_PASSWORD: ci-local-only
+      MYSQL_DATABASE: kagami_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: MySQL store tests (live)
+        # 照合順序 utf8mb4_bin はテーブル定義（storage_mysql._TABLE_OPTS）で指定しているので、サーバー既定のままでよい
+        run: python -m unittest tests.test_mysql_store -v
+
+  frontend:
+    name: frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20" # frontend/Dockerfile と揃える
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  # ---------------------------------------------------------------- CD
+  deploy-backend:
+    name: deploy backend (Cloud Run)
+    needs: [backend-sqlite, backend-mysql, frontend]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-backend
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # WIF（OIDC トークン）
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      AR_REPO: ${{ vars.AR_REPO }}
+      CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+      CLOUD_RUN_RUNTIME_SA: ${{ vars.CLOUD_RUN_RUNTIME_SA }}
+      CLOUDSQL_CONNECTION_NAME: ${{ vars.CLOUDSQL_CONNECTION_NAME }}
+      MYSQL_USER: ${{ vars.MYSQL_USER }}
+      MYSQL_DATABASE: ${{ vars.MYSQL_DATABASE }}
+      MYSQL_PASSWORD_SECRET: ${{ vars.MYSQL_PASSWORD_SECRET }}
+      UPLOADS_BUCKET: ${{ vars.UPLOADS_BUCKET }}
+      GEMINI_API_KEY_SECRET: ${{ vars.GEMINI_API_KEY_SECRET }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check required variables
+        run: |
+          missing=""
+          for v in GCP_PROJECT_ID GCP_REGION AR_REPO CLOUD_RUN_SERVICE CLOUDSQL_CONNECTION_NAME \
+                   MYSQL_USER MYSQL_DATABASE MYSQL_PASSWORD_SECRET UPLOADS_BUCKET; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::リポジトリの Variables が未設定です:$missing（README の「CI/CD」節を参照）"
+            exit 1
+          fi
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/backend:${GITHUB_SHA}"
+          gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" backend
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        run: |
+          # --set-env-vars / --set-secrets は既存の設定を置きかえる（ワークフローの内容が常に正）
+          ENV_VARS="DB_BACKEND=mysql,MYSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION_NAME},MYSQL_USER=${MYSQL_USER},MYSQL_DATABASE=${MYSQL_DATABASE},UPLOAD_BACKEND=gcs,GCS_UPLOAD_BUCKET=${UPLOADS_BUCKET}"
+          [ -n "$GEMINI_MODEL" ] && ENV_VARS="${ENV_VARS},GEMINI_MODEL=${GEMINI_MODEL}"
+          SECRETS="MYSQL_PASSWORD=${MYSQL_PASSWORD_SECRET}:latest"
+          # Gemini のキーは任意。シークレット名の Variable があるときだけ渡す（無ければモックで動く）
+          [ -n "$GEMINI_API_KEY_SECRET" ] && SECRETS="${SECRETS},GEMINI_API_KEY=${GEMINI_API_KEY_SECRET}:latest"
+          SA_FLAG=()
+          [ -n "$CLOUD_RUN_RUNTIME_SA" ] && SA_FLAG=(--service-account "$CLOUD_RUN_RUNTIME_SA")
+
+          gcloud run deploy "$CLOUD_RUN_SERVICE" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --image "$IMAGE" \
+            --port 8000 \
+            --set-env-vars "$ENV_VARS" \
+            --set-secrets "$SECRETS" \
+            --add-cloudsql-instances "$CLOUDSQL_CONNECTION_NAME" \
+            --min-instances 0 \
+            --allow-unauthenticated \
+            "${SA_FLAG[@]}" \
+            --quiet
+
+  deploy-frontend:
+    name: deploy frontend (GCS)
+    needs: [backend-sqlite, backend-mysql, frontend]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-frontend
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check required variables
+        run: |
+          if [ -z "$FRONTEND_BUCKET" ]; then
+            echo "::error::リポジトリの Variable FRONTEND_BUCKET が未設定です（README の「CI/CD」節を参照）"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync dist to bucket
+        working-directory: frontend
+        run: |
+          DEST="gs://${FRONTEND_BUCKET}"
+          # 1) ハッシュ付きファイル名の assets/ を長期キャッシュで先に置く（新しい index.html が参照するものを先に用意）
+          if [ -d dist/assets ]; then
+            gsutil -m -h "Cache-Control:public, max-age=31536000, immutable" rsync -r dist/assets "${DEST}/assets"
+          fi
+          # 2) index.html はキャッシュさせない（デプロイ直後から新しい assets を参照させるため）
+          gsutil -h "Cache-Control:no-cache" cp dist/index.html "${DEST}/index.html"
+          # 3) 残りのファイルを同期し、dist に無くなったもの（古い assets など）を削除する。
+          #    1)2) で置いたものは変更なしとして飛ばされる。dist 直下のそれ以外のファイル（public/ 由来など）は
+          #    Cache-Control を付けないので GCS の既定（公開オブジェクトは max-age=3600）になる
+          gsutil -m rsync -r -d dist "${DEST}"
+          # 念のため index.html のヘッダーを確定させる
+          gsutil setmeta -h "Cache-Control:no-cache" "${DEST}/index.html"
+
+  seed-demo:
+    name: seed demo data (Cloud Run Jobs)
+    needs: [deploy-backend]
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' && inputs.seed_demo
+    runs-on: ubuntu-latest
+    concurrency:
+      group: seed-demo
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      AR_REPO: ${{ vars.AR_REPO }}
+      SEED_JOB_NAME: ${{ vars.SEED_JOB_NAME || 'kagami-seed-demo' }}
+      CLOUD_RUN_RUNTIME_SA: ${{ vars.CLOUD_RUN_RUNTIME_SA }}
+      CLOUDSQL_CONNECTION_NAME: ${{ vars.CLOUDSQL_CONNECTION_NAME }}
+      MYSQL_USER: ${{ vars.MYSQL_USER }}
+      MYSQL_DATABASE: ${{ vars.MYSQL_DATABASE }}
+      MYSQL_PASSWORD_SECRET: ${{ vars.MYSQL_PASSWORD_SECRET }}
+      UPLOADS_BUCKET: ${{ vars.UPLOADS_BUCKET }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create or update the seed job
+        run: |
+          # deploy-backend が push したのと同じイメージ・同じ接続設定を使う。
+          # seed_demo.py は app.main を import するので、アップロード先（GCS）の設定も必要。
+          IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${AR_REPO}/backend:${GITHUB_SHA}"
+          ENV_VARS="DB_BACKEND=mysql,MYSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION_NAME},MYSQL_USER=${MYSQL_USER},MYSQL_DATABASE=${MYSQL_DATABASE},UPLOAD_BACKEND=gcs,GCS_UPLOAD_BUCKET=${UPLOADS_BUCKET}"
+          SECRETS="MYSQL_PASSWORD=${MYSQL_PASSWORD_SECRET}:latest"
+          # --confirm-mysql-reset には MYSQL_DATABASE と同じ値を渡す（seed_demo.py が一致を確認する）
+          ARGS="scripts/seed_demo.py,--reset,--with-letter,--confirm-mysql-reset,${MYSQL_DATABASE}"
+          SA_FLAG=()
+          [ -n "$CLOUD_RUN_RUNTIME_SA" ] && SA_FLAG=(--service-account "$CLOUD_RUN_RUNTIME_SA")
+
+          if gcloud run jobs describe "$SEED_JOB_NAME" --project "$GCP_PROJECT_ID" --region "$GCP_REGION" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+          gcloud run jobs "$ACTION" "$SEED_JOB_NAME" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --image "$IMAGE" \
+            --command python \
+            --args "$ARGS" \
+            --set-env-vars "$ENV_VARS" \
+            --set-secrets "$SECRETS" \
+            --set-cloudsql-instances "$CLOUDSQL_CONNECTION_NAME" \
+            --tasks 1 \
+            --max-retries 0 \
+            --task-timeout 600s \
+            "${SA_FLAG[@]}" \
+            --quiet
+
+      - name: Execute the seed job
+        run: |
+          gcloud run jobs execute "$SEED_JOB_NAME" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --wait
