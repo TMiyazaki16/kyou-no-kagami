@@ -32,3 +32,11 @@ export interface Ctx {
   go: (s: Screen) => void;
   refreshMe: () => Promise<void>;
 }
+
+/**
+ * 下部タブに出す主要画面（案B）。並びと文言は NAV のものを使う。
+ * ここにない画面（今日の一言・記録一覧・共有の確認・設定・家族・仕組みを見る・免責表示）は
+ * タブの「その他」から開くシートに、NAV の並びのまま出す。画面の数・名前・意味は変えない。
+ */
+export const TAB_IDS: Screen[] = ["home", "record", "reflect", "letters"];
+export const MORE_LABEL = "その他";

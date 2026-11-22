@@ -115,7 +115,7 @@ export function RecordScreen({ go }: Ctx) {
   return (
     <section>
       <h2>今日の記録</h2>
-      <div className="notice">🔒 この記録は、まだ誰にも届いていません</div>
+      <div className="notice notice-lock">🔒 この記録は、まだ誰にも届いていません</div>
       <p className="muted">
         共有は、あなたが「共有の確認」で内容を見て、送ると決めたときだけ行われます。
       </p>
@@ -125,43 +125,57 @@ export function RecordScreen({ go }: Ctx) {
         </p>
       )}
 
-      <div className="card">
+      <div className="card voice-card">
         <h3>声で残す</h3>
         {!recording ? (
-          <button className="primary" onClick={startRec}>🎙 録音をはじめる</button>
+          <button className="primary mic-btn" onClick={startRec}>🎙 録音をはじめる</button>
         ) : (
-          <button className="danger" onClick={stopRec}>⏹ 録音をとめる</button>
+          <button className="danger mic-btn" onClick={stopRec}>⏹ 録音をとめる</button>
         )}
         {audioBlob && !recording && <p className="ok">✓ 音声が用意できました</p>}
         {!audioBlob && existing?.audio_url && <p className="muted">今日の声の記録は保存済みです。</p>}
         <p className="muted">声で答えた内容は、下の欄に文字でも書いてもらえると、AIが言葉を拾いやすくなります。</p>
       </div>
 
-      <div className="card">
-        <label className="q">① 今日、感謝できることは？</label>
+      <div className="card answer-card">
+        <label className="q" htmlFor="q-gratitude">① 今日、感謝できることは？</label>
         <textarea
+          id="q-gratitude"
           value={gratitude}
           onChange={(e) => setGratitude(e.target.value)}
           placeholder="例：娘が電話をくれたこと"
           rows={2}
         />
-        <label className="q">② 今日の気分・体調を一言で言うと？</label>
+        <label className="q" htmlFor="q-mood">② 今日の気分・体調を一言で言うと？</label>
         <textarea
+          id="q-mood"
           value={mood}
           onChange={(e) => setMood(e.target.value)}
           placeholder="例：少し疲れたけど元気"
           rows={2}
         />
-        <label className="q">写真（任意）</label>
-        <input
-          type="file"
-          accept="image/jpeg,image/png,image/webp"
-          onChange={(e) => {
-            const f = e.target.files?.[0] ?? null;
-            setPhoto(f);
-            setPhotoUrl(f ? URL.createObjectURL(f) : null);
-          }}
-        />
+        {/* 案B: 写真は点線の枠（①② より小さく、任意であることが分かる見た目）。
+            ブラウザ標準の英語のボタンは隠し、枠全体を押せるラベルにする */}
+        <div className="photo-field">
+          <label className="q photo-picker" htmlFor="photo-input">
+            <svg className="photo-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 8.5A1.5 1.5 0 0 1 5.5 7h2l1.5-2h6l1.5 2h2A1.5 1.5 0 0 1 20 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5z" />
+              <circle cx="12" cy="12.5" r="3.5" />
+            </svg>
+            <span>写真（任意）</span>
+          </label>
+          <input
+            id="photo-input"
+            className="visually-hidden"
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              setPhoto(f);
+              setPhotoUrl(f ? URL.createObjectURL(f) : null);
+            }}
+          />
+        </div>
         {photoUrl && <img className="preview" src={photoUrl} alt="添付写真のプレビュー" />}
       </div>
 
@@ -174,9 +188,12 @@ export function RecordScreen({ go }: Ctx) {
           </button>
         </div>
       ) : (
-        <button className="primary big-btn" onClick={save} disabled={saving}>
-          {saving ? "保存して、AIに渡しています…" : "保存して「今日の一言」を受け取る"}
-        </button>
+        /* 案B: 保存ボタンは画面の下（タブのすぐ上）に固定。入力中は固定をやめる（styles.css） */
+        <div className="save-bar">
+          <button className="primary big-btn" onClick={save} disabled={saving}>
+            {saving ? "保存して、AIに渡しています…" : "保存して「今日の一言」を受け取る"}
+          </button>
+        </div>
       )}
     </section>
   );

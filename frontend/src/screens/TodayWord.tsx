@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Analysis, api, TodayWordResponse } from "../api";
 import { errText } from "../lib/format";
+import { QuotedText } from "../components/QuotedText";
 import type { Ctx } from "../navigation";
 
 /* ------------------------------------------------------------------ */
@@ -41,7 +42,7 @@ export function TodayWord({ go }: Ctx) {
         {recordId ? (
           <div className="card">
             <p>今日の記録は保存されています。一言はまだできていません。</p>
-            <button className="primary" onClick={() => retry(recordId)}>今日の一言を作る</button>
+            <button className="primary big-btn" onClick={() => retry(recordId)}>今日の一言を作る</button>
             {error && <p className="error">{error}</p>}
           </div>
         ) : (
@@ -56,18 +57,20 @@ export function TodayWord({ go }: Ctx) {
     <section>
       <h2>今日の一言</h2>
       {ana.kind === "voice_notice" ? (
-        <div className="card">
+        <div className="card kagami-card word-card">
           <p className="big">🎙 {ana.notice}</p>
-          <button className="primary" onClick={() => go("record")}>文字でも一言残す</button>
+          <button className="primary big-btn" onClick={() => go("record")}>文字でも一言残す</button>
         </div>
       ) : (
-        <div className="card highlight">
-          <p className="big">{ana.todays_word}</p>
+        <div className="card kagami-card word-card">
+          <p className="big todays-word">
+            <QuotedText text={ana.todays_word ?? ""} />
+          </p>
         </div>
       )}
-      <div className="card">
+      <div className="card obs-card">
         <h3>AIが観察したこと</h3>
-        <ul>
+        <ul className="obs-list">
           {ana.observations.map((o, i) => (
             <li key={i}>{o}</li>
           ))}

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, FamilyMember, Me, session, UNAUTHORIZED_EVENT } from "./api";
-import { Ctx, NAV, Screen } from "./navigation";
+import { Ctx, Screen } from "./navigation";
+import { BottomTabs } from "./components/BottomTabs";
 import { AuthScreen } from "./screens/AuthScreen";
 import { Home } from "./screens/Home";
 import { RecordScreen } from "./screens/RecordScreen";
@@ -77,26 +78,21 @@ export default function App() {
     );
   }
 
-  const go = (s: Screen) => setScreen(s);
+  const go = (s: Screen) => {
+    setScreen(s);
+    window.scrollTo(0, 0); // 画面を切り替えたら先頭から読めるようにする
+  };
   const ctx: Ctx = { me, family, go, refreshMe };
 
   return (
-    <div className="app">
-      <header className="header">
+    <div className="app app-authed">
+      <header className="header header-bar">
         <h1>きょうのかがみ</h1>
         <div className="user-switch">
           <span className="who">{me.display_name}</span>
           <button onClick={logout}>ログアウト</button>
         </div>
       </header>
-
-      <nav className="nav">
-        {NAV.map((n) => (
-          <button key={n.id} className={screen === n.id ? "active" : ""} onClick={() => go(n.id)}>
-            {n.label}
-          </button>
-        ))}
-      </nav>
 
       {/* H-5: アカウントが変わったら画面の状態を作り直す */}
       <main className="main" key={me.id}>
@@ -111,6 +107,9 @@ export default function App() {
         {screen === "settings" && <Settings {...ctx} />}
         {screen === "disclaimer" && <Disclaimer />}
       </main>
+
+      {/* 案B: 主要画面は下部タブ、残りは「その他」シート（画面の数・名前は NAV のまま） */}
+      <BottomTabs screen={screen} go={go} />
     </div>
   );
 }

@@ -15,7 +15,7 @@ export function RecordList() {
       <h2>記録一覧</h2>
       {records.length === 0 && <p className="muted">まだ記録がありません。</p>}
       {records.map((r) => (
-        <div className="card" key={r.id}>
+        <div className="card record-card" key={r.id}>
           <p className="date">{r.date}</p>
           <p>🙏 感謝：{r.gratitude || "（未入力）"}</p>
           <p>🌿 気分・体調：{r.mood || "（未入力）"}</p>
