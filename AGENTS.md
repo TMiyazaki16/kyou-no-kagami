@@ -41,9 +41,15 @@ backend/
   tests/test_mysql_store.py  MySQLStore の検証（オフライン検査は常時、実機検査は KAGAMI_TEST_MYSQL=1 のときだけ）
   tests/test_uploads.py  保存先の切替の検証（GCS はフェイクの Client。実機は使わない）
 frontend/src/
-  App.tsx             全10画面＋ログイン/登録
+  App.tsx             外枠のみ（ログイン確認・ヘッダー・ナビ・画面の切替）。画面の中身は書かない
+  navigation.ts       Screen（画面ID）・NAV（ナビの並びと文言）・Ctx（各画面に渡す共通 props）
+  screens/            1画面1ファイル（全10画面＋ログイン/登録 AuthScreen）。ファイル名＝コンポーネント名
+  components/         2画面以上で使う部品（WeeklyMessage）
+  lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText、audio.ts：録音形式）
   api.ts              API クライアントと型。トークンを localStorage に置き Authorization ヘッダーで送る
 ```
+
+フロントの依存は `App → screens → components / lib → api` の一方向。画面から `fetch` を直接呼ばず `api.ts` を通す。画面を足すときは `navigation.ts` の `Screen`・`NAV` と `App.tsx` の切替に1行ずつ足す（画面の追加自体はオーナー確認が要る）。
 
 ### アカウントと家族連携
 

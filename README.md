@@ -385,7 +385,11 @@ app/
     ├── Dockerfile / nginx.conf   # node:20-alpine でビルド → nginx:alpine で配信・/api と /uploads をプロキシ
     └── src/
         ├── main.tsx
-        ├── App.tsx       # 全10画面＋ログイン/登録
-        ├── api.ts        # API クライアント
+        ├── App.tsx       # 外枠（ログイン確認・ヘッダー・ナビ・画面の切替）
+        ├── navigation.ts # 画面ID（Screen）・ナビの並び（NAV）・各画面に渡す共通 props（Ctx）
+        ├── screens/      # 1画面1ファイル（全10画面＋ログイン/登録の AuthScreen）
+        ├── components/   # 複数画面で使う部品（WeeklyMessage）
+        ├── lib/          # 画面に依存しない小さな関数（format.ts：日付・エラー文、audio.ts：録音形式）
+        ├── api.ts        # API クライアントと型（画面は API をここ経由でだけ呼ぶ）
         └── styles.css
 ```
