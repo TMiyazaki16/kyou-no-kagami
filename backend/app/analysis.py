@@ -34,6 +34,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from datetime import date
 
 from . import rules
 
@@ -62,10 +63,22 @@ FIXED_CARE_PHRASE = "気になることが続くときは、かかりつけの�
 VOICE_NOTICE = "声の記録を受け取りました。文字でも一言残すと、今日の一言にあなたの言葉が反映されます"
 
 SYSTEM_RULES = (
-    "あなたは本人の自己認知を助ける『鏡』です。観察だけを返し、判断・診断はしません。"
-    "病名や医療的な助言（受診・薬・病院などへの言及を含む）は一切出しません。"
-    "本人が書いた（話した）言葉を「」で具体的にそのまま引用して、"
-    "その人自身に気づきを返す短い『今日の一言』を作ってください。"
+    "あなたは本人の自己認知を助ける『鏡』です。カウンセラーのように、やわらかく受けとめる視座で"
+    "本人の言葉を映し返します。観察と映し返しだけを返し、判断・診断・評価はしません。"
+    "病名や医療的な助言（受診・薬・病院などへの言及を含む）は一切出しません。\n"
+    "『今日の一言』は日記の要約ではありません。本人が自分では気づいていないかもしれない面を、"
+    "そっと映し返す短い一言です。次のように作ってください。\n"
+    "1. 本人が書いた（話した）言葉を「」で具体的にそのまま引用する。\n"
+    "2. その言葉の裏にある気持ちやニュアンスを拾って映し返す。"
+    "（例：「元気だけど眠い」なら、元気さと眠さが同居していること自体に目を向ける。"
+    "「そこそこ」「なんとか」のような言い回しや「！」にも、そのときの気持ちが表れる）\n"
+    "3. 本人が気づいていなさそうな点に、やわらかく光を当てたり言い換えたりする（リフレーミング）。"
+    "決めつけず「〜かもしれません」「〜のようです」のように書く。\n"
+    "4. 締めは、答えを求めない短い問いかけにしてもよい（毎回でなくてよい）。\n"
+    "書かないこと：アドバイスや指示（「〜しましょう」「〜してみては」等）、"
+    "決まり文句の励まし（「がんばりましたね」等）、気持ちの断定、良し悪しの評価、"
+    "体調やその原因の推測。\n"
+    "長さは2〜3文、全体で120字程度まで。"
 )
 
 # (a) NG語。誤検出しやすい短いひらがな（「がん」=がんばる、「うつ」=うつくしい 等）は入れない。
@@ -342,29 +355,138 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
 # Local mock engine (deterministic)
 # --------------------------------------------------------------------------
 
+# モックの「今日の一言」：日記の要約ではなく、本人の言葉を映し返す決定的なテンプレート。
+# 気分のことばの手ざわり（「〜けど」の同居・沈み気味・明るい・「そこそこ」等の言い回し）を
+# 語の一致だけで拾い、引用＋やわらかい着目（＋ときに答えを求めない問いかけ）で返す。
+# 判断・診断・助言・原因の推測・過去との比較は書かない（ベースライン中でもそのまま使えるように）。
+# 検出用の語は出力には出さない。出力に出るのは本人の言葉（「」の中）とテンプレートの地の文だけ。
+_CONTRAST = ("だけど", "だけれど", "けれども", "けれど", "けど", "でも", "のに", "が、")
+_LOW_CUES = (
+    "疲れ", "つかれ", "だるい", "しんどい", "つらい", "辛い", "落ち込", "沈ん", "イライラ", "いらいら",
+    "不安", "眠い", "ねむい", "眠た", "重い", "いまいち", "イマイチ", "元気がない", "元気ない", "さみしい",
+    "寂しい", "もやもや", "モヤモヤ", "ため息", "へとへと", "ぐったり", "痛い", "悲しい", "かなしい",
+    "しょんぼり", "憂う", "だめ", "ダメ", "ぼんやり", "ゆううつ",
+)
+_UP_CUES = (
+    "元気", "楽しい", "たのしい", "うれしい", "嬉しい", "いい", "良い", "よい", "よかった", "すっきり",
+    "スッキリ", "爽やか", "さわやか", "穏やか", "おだやか", "最高", "幸せ", "しあわせ", "ほっと", "軽",
+    "上々", "好調", "わくわく", "ワクワク", "のんびり",
+)
+_HEDGES = ("そこそこ", "まあまあ", "まずまず", "わりと", "それなりに", "ぼちぼち")
+_NO_GRATITUDE = {"なし", "特になし", "とくになし", "特にない", "ない", "無し", "特に無し"}
+_PART_STRIP = "、。，．,.!！?？ 　"
+
+
+def _first_cue(text: str, cues: tuple[str, ...]) -> tuple[int, str] | None:
+    """text の中で最初に現れる手がかり語の (位置, 語)。"""
+    hits = [(text.find(c), c) for c in cues if c in text]
+    return min(hits) if hits else None
+
+
+def _contrast_pair(mood: str) -> tuple[str, str] | None:
+    """「元気だけど眠い」→（元気, 眠い）。接続の語が無くても、明るい語と沈み気味の語が両方あれば対にする。"""
+    hits = [(mood.find(c), -len(c), c) for c in _CONTRAST if c in mood]
+    if hits:
+        pos, _, c = min(hits)
+        a, b = mood[:pos].strip(_PART_STRIP), mood[pos + len(c):].strip(_PART_STRIP)
+        if a and b:
+            return a, b
+    low = _first_cue(mood, _LOW_CUES)
+    up = _first_cue(mood, _UP_CUES)
+    if low and up and "元気がない" not in mood and "元気ない" not in mood:
+        (_, x), (_, y) = sorted([low, up])
+        return x, y
+    return None
+
+
+def _mirror_word(gratitude: str, mood: str, spoken: str, turn: int) -> str:
+    g = "" if gratitude.strip(_PART_STRIP) in _NO_GRATITUDE else gratitude
+    m = mood
+
+    def pick(*variants: str) -> str:  # 同じ型の日が続いても、隣り合う日で締めの文が変わるように
+        return variants[turn % len(variants)]
+
+    if m:
+        pair = _contrast_pair(m)
+        if pair:
+            a, b = pair
+            head = f"「{g}」に目を留めた今日。" if g else ""
+            tail = pick(
+                "どちらかに決めてしまわずに両方を書けたのは、今の自分をていねいに見ているからかもしれません。",
+                f"今日は「{a}」と「{b}」の、どちらが少し大きかったでしょう。",
+                "どちらも今日の本当の感じとして、そのまま並べておいていいのかもしれません。",
+            )
+            return f"{head}「{a}」と「{b}」が、ひとつの言葉の中に同居していますね。{tail}"
+
+        if _first_cue(m, _LOW_CUES):
+            if g:
+                tail = pick(
+                    "重さを感じながらも、ありがたいものを見つけられている。その両方が、今日のあなたです。",
+                    "その気持ちとありがたさは、同じ一日の中に並んでいられるのかもしれませんね。",
+                    "気持ちが重い日に目に留まるものには、その人らしさが表れるのかもしれません。",
+                )
+                return f"気分は「{m}」。そんな日にも「{g}」に目が向いていました。{tail}"
+            tail = pick(
+                "無理に前向きに言い換えずに書けたこと自体が、自分の声をちゃんと聞けているしるしかもしれません。",
+                "その言葉の奥には、どんな気持ちがあったでしょう。言葉にならなくても、ここに置いておけます。",
+                "こういう日の言葉も、あなたが自分を知るための、大事な手がかりのひとつです。",
+            )
+            return f"「{m}」と、そのままの言葉で残してくれました。{tail}"
+
+        if _first_cue(m, _UP_CUES):
+            hedge = _first_cue(m, _HEDGES)
+            if hedge:
+                tail = (f"「{hedge[1]}」という言い方に、無理に盛らない、"
+                        "今のあなたのちょうどいい手ざわりが映っているようです。")
+            elif g:
+                tail = pick(
+                    "明るい気持ちのとき、自分が何に心を動かされるのか。今日の言葉がそっと教えてくれています。",
+                    "その明るさと、ありがたいと感じたことは、どこかでつながっていたのかもしれませんね。",
+                    "その心地よさは、今日のどんな瞬間にいちばん感じられたでしょう。",
+                )
+            else:
+                tail = pick(
+                    "その明るさは、今日のどんな場面から来ていたのでしょう。",
+                    "言葉の弾み方に、今日のあなたの調子がそのまま映っているようです。",
+                )
+            if g:
+                return f"「{g}」と「{m}」。感謝と気分が、同じ明るい方を向いている一日でした。{tail}"
+            return f"「{m}」と書いてくれた今日。{tail}"
+
+        # 手がかり語のない気分のことば
+        if g:
+            tail = pick(
+                f"「{m}」という言葉を選んだとき、心のどこが動いていたでしょう。",
+                "たくさんの出来事の中からそれを選んだところに、"
+                "今のあなたが大事にしているものが映っているのかもしれません。",
+                f"「{m}」のひと言の中に、言葉にしきれなかった気持ちも混ざっているかもしれませんね。",
+            )
+            return f"「{g}」に目が向いた今日。気分は「{m}」と言葉にしてくれました。{tail}"
+        tail = pick(
+            "その言葉を選んだとき、心のどこが動いていたでしょう。",
+            "短いひと言にも、そのときの気持ちの手ざわりが残っています。",
+        )
+        return f"今日の気分は「{m}」。{tail}"
+
+    if g:
+        return (f"今日は「{g}」に目が向きました。たくさんの出来事の中からそれを選んだところに、"
+                "今のあなたが大事にしているものが映っているようです。")
+    return (f"声で「{spoken}」と話してくれました。声に出したその言葉を、"
+            "もう一度自分で聞いてみると、何か見えてくるかもしれません。")
+
+
 def _analyze_mock(record: dict, baseline_day: int, previous: dict | None) -> dict:
     gratitude = _short(record.get("gratitude", ""))
     mood = _short(record.get("mood", ""), 30)
     spoken = _short(record.get("transcript", ""), 40)
-    seed = int(hashlib.md5(f"{record['user_id']}|{record['date']}".encode()).hexdigest(), 16)
+    try:  # 日付の通し番号。連続した日は締めの文が順に入れ替わる（「これまでの一言」が同じ文の繰り返しにならない）
+        turn = date.fromisoformat(record["date"]).toordinal()
+    except (TypeError, ValueError):
+        turn = int(hashlib.md5(f"{record['user_id']}|{record['date']}".encode()).hexdigest(), 16)
 
     kind, notice, todays_word = "word", "", None
-    if gratitude and mood:
-        templates = [
-            "「{g}」にありがとうを感じられた今日。気分は「{m}」とのことでした。"
-            "その気持ちを自分の言葉で残せたこと自体が、今日のあなたの記録です。",
-            "今日の感謝は「{g}」。そして気分は「{m}」。"
-            "うれしいことも、そうでない気持ちも、どちらも今日のあなたの一部ですね。",
-            "「{g}」があった一日。気分は「{m}」と教えてくれました。"
-            "言葉にしてみると、昨日より少しだけ自分のことが見えてくるかもしれません。",
-        ]
-        todays_word = templates[seed % len(templates)].format(g=gratitude, m=mood)
-    elif gratitude:
-        todays_word = f"今日の感謝は「{gratitude}」。その一言を残せたことが、今日のあなたの記録です。"
-    elif mood:
-        todays_word = f"今日の気分は「{mood}」と教えてくれました。そのままの言葉を、ここに置いておきます。"
-    elif spoken:
-        todays_word = f"声で「{spoken}」と話してくれました。その言葉を、今日の記録として置いておきます。"
+    if gratitude or mood or spoken:
+        todays_word = _mirror_word(gratitude, mood, spoken, turn)
     else:
         # 汎用文は出さない。案内文を、一言とは区別できる形で返す。
         kind, notice = "voice_notice", VOICE_NOTICE
@@ -422,7 +544,7 @@ def _gemini_prompt(request: dict, with_audio: bool) -> str:
         f"今日のメモ:\n- 感謝できること: {inputs['gratitude']}\n- 気分・体調: {inputs['mood']}\n"
         "体調についての助言・受診の勧め・病名は書かないでください（必要な定型文はアプリ側で付けます）。\n"
         "出力はJSONのみ: {\"transcript\": \"音声の文字起こし（音声が無ければ空文字）\", "
-        "\"todays_word\": \"本人の言葉を「」で具体的に引用した短い一言\", "
+        "\"todays_word\": \"本人の言葉を「」で具体的に引用し、その裏の気持ちを映し返す2〜3文の一言\", "
         "\"observations\": [\"観察の箇条書き\"]}"
     )
 
