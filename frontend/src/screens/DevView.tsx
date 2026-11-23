@@ -15,6 +15,8 @@ const FALLBACK_TEXT: Record<string, string> = {
     "Gemini の出力が本人の言葉を引用していなかったため不採用とし、ローカルモックに差し替えました。",
   guard_baseline_change:
     "最初の7日間なのに、Gemini の一言が変化に触れていた（「いつもより」「最近」など）ため不採用とし、ローカルモックに差し替えました。",
+  guard_assertive:
+    "Gemini の出力が疲れ・体調を言い切っていた（「疲れているようです」など）ため不採用とし、ローカルモックに差し替えました。",
 };
 
 export function DevView() {
