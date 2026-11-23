@@ -22,11 +22,17 @@ Gemini の出力はそのまま使わず、後段ガード（`guard_gemini`）�
   (d) 健康への配慮が必要な文脈では、FIXED_CARE_PHRASE をサーバー側で付与
   (e) ベースライン期間中に今日の一言が変化に触れていたら（「いつもより」「最近」等）不採用→モック
   (f) 疲れ・体調についての断定調（「疲れているようです」等。「かもしれ」や問いかけの形でない文）→ 不採用→モック
-  (a)(e) は、本人の言葉をそのまま「」で引用した部分を除いて検査する。(f) は直近の記録の言葉の引用も除く。
+  (g) 外見へのコメント（「痩せた」「老けた」「顔色」等。写真があってもなくても）→ 不採用→モック
+  (a)(e)(g) は、本人の言葉をそのまま「」で引用した部分を除いて検査する。(f) は直近の記録の言葉の引用も除く。
 
 直近の流れ（#9）：ベースライン後は、過去 RECENT_CONTEXT_DAYS 日の記録の要約（recent_days）と、
 変化検知ルールの発火結果から作った傾向の手がかり（trends）をプロンプトに添える。
 傾向がある日だけ、今日の映し返しに添えて「少し疲れているのかもしれませんね」程度のやわらかさで触れる。
+
+写真（#11）：記録に写真があれば inline_data で一緒に渡す（主モデル・代替モデルとも）。拾うのは本人の「様子」
+（表情の明るさ・姿勢・部屋の明るさ等）だけで、言葉・声と並ぶ材料の一つとして添える。外見へのコメントは (g) で止める。
+写真を受け付けない恒常的エラー（400 等）のときは、写真を外して同じモデルで続行する（写真は任意なので音声より先に外す）。
+モックは写真の中身を見ないので、写真が届いたことにだけ触れる。
 """
 from __future__ import annotations
 
@@ -131,8 +137,34 @@ STATE_CUES = (
 _HEDGE_MARKS = ("かもしれ", "でしょうか", "？", "?")
 _SENTENCE = re.compile(r"[^。！!？?\n]+[。！!？?]*")
 
-# アップロード時に許可している音声 MIME（main.py と同じ集合）
+# アップロード時に許可している音声・写真の MIME（main.py / uploads.py と同じ集合）
 AUDIO_MIMES = {"audio/webm", "audio/mp4", "audio/ogg"}
+PHOTO_MIMES = {"image/jpeg", "image/png", "image/webp"}
+
+# 写真の扱い（写真を渡すときだけプロンプトに足す）
+PHOTO_RULES = (
+    "添付の写真は、本人が今日の記録に任意で添えた1枚です。写真から拾ってよいのは、そのときの『様子』だけです"
+    "（例：表情の明るさ、姿勢、部屋や光の明るさ、写っているもの）。"
+    "外見（体型・痩せた／太った・老けた・顔色・肌・髪・しわ等）には一切触れません。"
+    "写っている人が誰かを推測したり、写真から体調や気持ちを判断したりもしません。"
+    "写真だけで結論を出さず、本人の言葉（と声）の映し返しを主にして、写真の様子は添える程度にしてください"
+    "（例：「写真には、やわらかい光が差し込んでいますね」）。"
+    "言葉と写真の様子が違って見えても、どちらが本当かを決めず、両方をそのまま並べるだけにします。"
+    "観察（observations）で写真に触れるときは「写真：」で始まる1項目までにしてください。\n"
+)
+
+# (g) 外見へのコメント。AI 自身の地の文（本人の言葉の引用を除く）にあれば不採用にする。
+# 「くま」「しわ」「クマ」（ぬいぐるみ等、写真に写りうる物）のような誤検出しやすい語は、複合の形だけを入れる。
+APPEARANCE_WORDS = (
+    "痩せ", "やせて", "やせた", "やせ細", "ほっそり", "太っ", "太り", "ふっくら", "肥満", "体型", "体重",
+    "老け", "ふけて", "ふけた", "老い", "老化", "年をとっ", "歳をとっ", "年老", "若々し", "若く見え",
+    "顔色", "血色", "青白", "土気色", "やつれ", "げっそり", "頬がこけ", "こけて", "むくみ", "むくん",
+    "肌荒れ", "肌つや", "肌の色", "肌の調子", "シワ", "しわが", "しわの", "白髪", "目の下", "クマが", "クマができ",
+    "見た目", "外見", "容姿", "顔つき",
+)
+
+# モック・ベースラインの定型観察文で、写真が届いていることにだけ触れる（中身は見ていない）
+PHOTO_RECEIVED_OBSERVATION = "写真：1枚、添えてくれました"
 
 
 def _short(text: str, limit: int = 40) -> str:
@@ -224,6 +256,12 @@ def find_assertive_state(*texts: str) -> list[str]:
     return hits
 
 
+def find_appearance_words(*texts: str) -> list[str]:
+    """(g) 外見へのコメント語を返す（引用部分は呼び出し側で除いておく）。"""
+    joined = "\n".join(t or "" for t in texts)
+    return [w for w in APPEARANCE_WORDS if w in joined]
+
+
 def baseline_observations(record: dict, baseline_day: int) -> list[str]:
     """(c) ベースライン期間のサーバー側定型観察文。"""
     g = _short(record.get("gratitude", ""))
@@ -234,6 +272,8 @@ def baseline_observations(record: dict, baseline_day: int) -> list[str]:
     ]
     if (record.get("transcript") or "").strip():
         obs.append(f"声で話したこと：『{_short(record['transcript'], 40)}』")
+    if record.get("photo_path"):
+        obs.append(PHOTO_RECEIVED_OBSERVATION)
     obs.append(
         f"いまは『いつものあなた』を覚えている期間です（{baseline_day}日目／{BASELINE_DAYS}日間）。"
         "変化についてのコメントはまだしません。"
@@ -251,9 +291,12 @@ def analyze(
     previous: dict | None,
     history: list[dict] | None = None,
     audio: tuple[bytes, str] | None = None,
+    photo: tuple[bytes, str] | None = None,
 ) -> dict:
     """Returns {todays_word, kind, notice, observations, engine, fallback_reason,
-    transcript, request, response}."""
+    transcript, request, response}.
+
+    audio / photo は (中身, MIME)。中身はリクエストのログ（request）には残さない。"""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     in_baseline = baseline_day <= BASELINE_DAYS
     request = {
@@ -267,7 +310,8 @@ def analyze(
             "transcript": record.get("transcript", ""),
             "has_audio": bool(audio),
             "audio_mime": audio[1] if audio else None,
-            "has_photo": bool(record.get("photo_path")),
+            "has_photo": bool(photo or record.get("photo_path")),
+            "photo_mime": photo[1] if photo else None,
         },
         "rules": SYSTEM_RULES,
     }
@@ -291,7 +335,7 @@ def analyze(
             remaining = GEMINI_TOTAL_BUDGET_SEC - (_monotonic() - start)
             deadline = _monotonic() + remaining / (len(models) - i)
             try:
-                g = _analyze_gemini(api_key, request, record, audio, model, deadline, attempts)
+                g = _analyze_gemini(api_key, request, record, audio, model, deadline, attempts, photo)
                 break
             except Exception as exc:  # 次のモデルへ。全滅したらモック
                 last_error = exc
@@ -323,6 +367,8 @@ def analyze(
         if change["care_context"] and FIXED_CARE_PHRASE not in result["observations"]:
             result["observations"].append(FIXED_CARE_PHRASE)
 
+    if request["inputs"]["has_photo"]:
+        result["response"]["photo"] = photo_status(result, bool(photo))
     result["request"] = request
     result["response"]["final"] = {
         "kind": result["kind"],
@@ -331,6 +377,27 @@ def analyze(
         "observations": result["observations"],
     }
     return result
+
+
+def photo_status(result: dict, readable: bool) -> dict:
+    """「仕組みを見る」向け：写真が Gemini に渡ったか、最終の出力に反映されうるか。
+
+    - sent_to_gemini：写真を含めた呼び出しが成功した（試行ログの input に「+photo」）
+    - used_in_output：その Gemini の出力をガード通過で採用した（モックに落ちたら False）
+    - dropped_error：写真を受け付けない恒常的エラーで、写真を外して続行したときのエラー
+    """
+    resp = result["response"]
+    gem = resp if resp.get("engine") == "gemini" else (resp.get("gemini") or {})
+    sent = bool(gem.get("photo_included"))
+    attempts = resp.get("gemini_attempts") or gem.get("gemini_attempts") or []
+    return {
+        "attached": True,
+        "readable": readable,
+        "sent_to_gemini": sent,
+        "used_in_output": sent and result["engine"] == "gemini",
+        "tried_with_photo": any("+photo" in a.get("input", "") for a in attempts),
+        "dropped_error": gem.get("photo_error"),
+    }
 
 
 def recent_days(record: dict, history: list[dict]) -> list[dict]:
@@ -403,7 +470,8 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
         raw_obs = [raw_obs]
     observations = [str(o) for o in raw_obs]
 
-    guard: dict = {"ng_words": [], "quote": None, "baseline_change": [], "assertive": [], "passed": False}
+    guard: dict = {"ng_words": [], "appearance": [], "quote": None, "baseline_change": [], "assertive": [],
+                   "passed": False}
     reason = ""
     if not answers:
         # 文字も文字起こしも無い（声が聞き取れなかった等）→ 汎用文を出さずに案内
@@ -412,8 +480,11 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
         # 本人の言葉をそのまま引用した部分は除いて検査する（本人が書いた「薬」「病院」で弾かない）
         own = [strip_user_quotes(t, answers) for t in (word, *observations)]
         guard["ng_words"] = find_ng_words(*own)
+        guard["appearance"] = find_appearance_words(*own)
         if guard["ng_words"]:
             reason = "guard_ng_word"
+        elif guard["appearance"]:
+            reason = "guard_appearance"  # (g) 写真の有無によらず、外見には触れない
         else:
             guard["quote"] = has_quote(answers, word)
             if not guard["quote"]:
@@ -633,6 +704,10 @@ def _analyze_mock(record: dict, baseline_day: int, previous: dict | None,
     if mood:
         observations.insert(1 if gratitude else 0, f"気分・体調のことば：『{mood}』")
 
+    if record.get("photo_path"):
+        # 写真の中身は見ていない（解析したふりをしない）。届いたことにだけ触れる
+        observations.append(PHOTO_RECEIVED_OBSERVATION)
+
     return {
         "todays_word": todays_word,
         "kind": kind,
@@ -647,6 +722,8 @@ def _analyze_mock(record: dict, baseline_day: int, previous: dict | None,
                     "そのまま引用しています。",
             "todays_word": todays_word,
             "notice": notice,
+            **({"photo_note": "写真は届いていますが、ローカルモックは写真の中身を見ていません。"}
+               if record.get("photo_path") else {}),
         },
     }
 
@@ -655,7 +732,7 @@ def _analyze_mock(record: dict, baseline_day: int, previous: dict | None,
 # Gemini engine
 # --------------------------------------------------------------------------
 
-def _gemini_prompt(request: dict, with_audio: bool) -> str:
+def _gemini_prompt(request: dict, with_audio: bool, with_photo: bool = False) -> str:
     inputs = request["inputs"]
     baseline_note = (
         f"現在はベースライン学習期間（{request['baseline_day']}日目）です。変化への言及はしないでください。"
@@ -669,7 +746,7 @@ def _gemini_prompt(request: dict, with_audio: bool) -> str:
         if with_audio else ""
     )
     return (
-        f"{SYSTEM_RULES}\n{baseline_note}\n{audio_note}{_recent_block(request)}"
+        f"{SYSTEM_RULES}\n{baseline_note}\n{audio_note}{PHOTO_RULES if with_photo else ''}{_recent_block(request)}"
         f"質問: ①今日、感謝できることは？ ②今日の気分・体調を一言で言うと？\n"
         f"今日のメモ:\n- 感謝できること: {inputs['gratitude']}\n- 気分・体調: {inputs['mood']}\n"
         "体調についての助言・受診の勧め・病名は書かないでください（必要な定型文はアプリ側で付けます）。\n"
@@ -776,40 +853,47 @@ def _call_with_retry(api_key: str, model: str, parts: list[dict], deadline: floa
 
 def _analyze_gemini(api_key: str, request: dict, record: dict, audio: tuple[bytes, str] | None,
                     model: str | None = None, deadline: float | None = None,
-                    attempts: list[dict] | None = None) -> dict:
+                    attempts: list[dict] | None = None,
+                    photo: tuple[bytes, str] | None = None) -> dict:
     model = model or request.get("model") or gemini_model()
     deadline = deadline if deadline is not None else _monotonic() + GEMINI_TOTAL_BUDGET_SEC
     attempts = attempts if attempts is not None else []
-    audio_ok = bool(audio) and audio[1] in AUDIO_MIMES  # type: ignore[index]
-    audio_error = None
-    raw = None
-    if audio_ok:
-        data, mime = audio  # type: ignore[misc]
-        parts = [
-            {"text": _gemini_prompt(request, True)},
-            {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
-        ]
+    use_audio = bool(audio) and audio[1] in AUDIO_MIMES  # type: ignore[index]
+    use_photo = bool(photo) and photo[1] in PHOTO_MIMES  # type: ignore[index]
+    audio_error = photo_error = None
+    while True:
+        parts = [{"text": _gemini_prompt(request, use_audio, use_photo)}]
+        for media, on in ((audio, use_audio), (photo, use_photo)):
+            if on:
+                data, mime = media  # type: ignore[misc]
+                parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}})
+        label = "text" + ("+audio" if use_audio else "") + ("+photo" if use_photo else "")
         try:
-            raw = _call_with_retry(api_key, model, parts, deadline, attempts, "text+audio")
+            raw = _call_with_retry(api_key, model, parts, deadline, attempts, label)
+            break
         except Exception as exc:
-            # 一次的エラー（混雑）を使い切ったときは、音声のまま次のモデルへ
-            if _is_transient(exc):
+            # 一次的エラー（混雑）を使い切ったときは、音声・写真のまま次のモデルへ
+            if _is_transient(exc) or not (use_audio or use_photo):
                 raise
-            # 音声形式を受け付けない等。文字があれば文字だけで再試行する
-            audio_error = _redact(str(exc), api_key)
-            if not (record.get("gratitude") or record.get("mood")):
-                raise
-    if raw is None:
-        raw = _call_with_retry(api_key, model, [{"text": _gemini_prompt(request, False)}],
-                               deadline, attempts, "text")
+            # 形式を受け付けない等の恒常的エラー。写真（任意）を先に外し、次に音声を外して同じモデルで再試行する
+            if use_photo:
+                use_photo, photo_error = False, _redact(str(exc), api_key)
+            else:
+                use_audio, audio_error = False, _redact(str(exc), api_key)
+                if not (record.get("gratitude") or record.get("mood")):
+                    raise
     text = raw["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(text)
     response = {"engine": "gemini", "model": model, "raw": raw, "parsed": parsed}
     if audio_error:
         response["audio_error"] = audio_error
+    if photo:
+        response["photo_included"] = use_photo
+        if photo_error:
+            response["photo_error"] = photo_error
     return {
         "todays_word": parsed.get("todays_word", ""),
         "observations": parsed.get("observations", []) or [],
-        "transcript": (parsed.get("transcript") or "") if audio_ok and not audio_error else "",
+        "transcript": (parsed.get("transcript") or "") if use_audio else "",
         "response": response,
     }

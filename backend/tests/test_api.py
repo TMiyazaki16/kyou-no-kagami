@@ -549,7 +549,8 @@ def scripted_gemini(script: dict):
     counters: dict = {}
 
     def _call(api_key, model, parts, timeout=None):
-        calls.append({"model": model, "audio": any("inline_data" in p for p in parts), "timeout": timeout})
+        calls.append({"model": model, "audio": any("inline_data" in p for p in parts), "timeout": timeout,
+                      "mimes": [p["inline_data"]["mime_type"] for p in parts if "inline_data" in p]})
         i = counters.get(model, 0)
         counters[model] = i + 1
         seq = script.get(model, [])
@@ -724,6 +725,206 @@ class TestGeminiFallback(Base):
         # 主モデルが時間を使い切っても、代替モデルにも呼び出しの時間が残っている
         models = [x["model"] for x in a["response"]["gemini_attempts"]]
         self.assertIn(self.FALLBACK, models)
+
+
+# --------------------------------------------------------------------------
+PHOTO_FILE = {"photo": ("me.png", PNG, "image/png")}
+PHOTO_WORD = {"todays_word": "「庭のバラ」に目が向いた今日。写真にも、やわらかい光が差し込んでいますね。",
+              "observations": ["写真：窓からの光が部屋を明るくしています"]}
+
+
+class TestPhotoAnalysis(Base):
+    """写真を解析に含める（#11）。様子の観察だけで、外見コメントはガードで止める。"""
+    PRIMARY = analysis.DEFAULT_GEMINI_MODEL
+    FALLBACK = analysis.DEFAULT_GEMINI_FALLBACK_MODEL
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+
+    def _analyze(self, script, files=None, **fields):
+        fields.setdefault("gratitude", "庭のバラ")
+        fields.setdefault("mood", "元気")
+        call, calls = scripted_gemini(script)
+        rec = self.post_record(files=files, **fields).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        return a, calls
+
+    def test_photo_sent_inline_with_prompt(self):
+        call, calls = fake_gemini(PHOTO_WORD)
+        rec = self.post_record(gratitude="庭のバラ", mood="元気", files=PHOTO_FILE).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        parts = calls[0]["parts"]
+        self.assertEqual(len(calls), 1)
+        inline = [p["inline_data"] for p in parts if "inline_data" in p]
+        self.assertEqual([i["mime_type"] for i in inline], ["image/png"])
+        import base64
+        self.assertEqual(base64.b64decode(inline[0]["data"]), PNG)
+        self.assertIn(analysis.PHOTO_RULES, parts[0]["text"])  # 様子だけ・外見に触れない指示
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["todays_word"], PHOTO_WORD["todays_word"])
+        self.assertEqual(a["response"]["gemini_attempts"],
+                         [{"model": self.PRIMARY, "input": "text+photo", "attempt": 1, "ok": True}])
+        self.assertEqual(a["request"]["inputs"]["photo_mime"], "image/png")
+        self.assertTrue(a["request"]["inputs"]["has_photo"])
+        photo = a["response"]["photo"]
+        self.assertTrue(photo["sent_to_gemini"])
+        self.assertTrue(photo["used_in_output"])
+        self.assertIsNone(photo["dropped_error"])
+        # 写真の本体はリクエストのログ・保存した解析に残さない
+        self.assertNotIn(inline[0]["data"], json.dumps(a, ensure_ascii=False))
+        dev = self.c.get("/api/dev/latest-analysis").json()
+        self.assertTrue(dev["analysis"]["response"]["photo"]["sent_to_gemini"])
+
+    def test_photo_and_audio_sent_together(self):
+        ok = {"transcript": "孫から手紙が届いた", "todays_word": "「孫から手紙が届いた」一日。", "observations": []}
+        a, calls = self._analyze({self.PRIMARY: [ok]},
+                                 files={"audio": ("memo.ogg", b"OggS" + b"0" * 200, "audio/ogg"), **PHOTO_FILE})
+        self.assertEqual(calls[0]["mimes"], ["audio/ogg", "image/png"])
+        self.assertEqual(a["response"]["gemini_attempts"][0]["input"], "text+audio+photo")
+        self.assertEqual(self.store.get_record(a["record_id"])["transcript"], "孫から手紙が届いた")
+
+    def test_photo_kept_through_fallback_chain_on_transient_error(self):
+        a, calls = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [PHOTO_WORD]}, files=PHOTO_FILE)
+        # 混雑（一次的エラー）では写真を外さず、写真ごと再試行・代替モデルへ
+        self.assertEqual([(c["model"], c["mimes"]) for c in calls],
+                         [(self.PRIMARY, ["image/png"])] * 3 + [(self.FALLBACK, ["image/png"])])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["request"]["model"], self.FALLBACK)
+        self.assertTrue(a["response"]["photo"]["used_in_output"])
+
+    def test_photo_permanent_error_continues_without_photo(self):
+        a, calls = self._analyze({self.PRIMARY: [analysis.GeminiHTTPError(400, "unsupported image"), OK_WORD]},
+                                 files=PHOTO_FILE)
+        self.assertEqual([(c["model"], c["mimes"]) for c in calls], [(self.PRIMARY, ["image/png"]), (self.PRIMARY, [])])
+        self.assertEqual(self.sleeps, [])  # 恒常的エラーは待たずに写真を外す
+        self.assertEqual(a["engine"], "gemini")  # 解析自体は失敗させない
+        self.assertEqual(a["fallback_reason"], "")
+        self.assertEqual(a["todays_word"], OK_WORD["todays_word"])
+        self.assertEqual([x["input"] for x in a["response"]["gemini_attempts"]], ["text+photo", "text"])
+        self.assertNotIn(analysis.PHOTO_RULES, json.dumps(calls, ensure_ascii=False))
+        photo = a["response"]["photo"]
+        self.assertFalse(photo["sent_to_gemini"])
+        self.assertTrue(photo["tried_with_photo"])
+        self.assertIn("HTTP 400", photo["dropped_error"])
+
+    def test_photo_dropped_before_audio(self):
+        ok = {"transcript": "孫から手紙が届いた", "todays_word": "「孫から手紙が届いた」一日。", "observations": []}
+        a, calls = self._analyze({self.PRIMARY: [analysis.GeminiHTTPError(400, "bad image"), ok]},
+                                 files={"audio": ("memo.ogg", b"OggS" + b"0" * 200, "audio/ogg"), **PHOTO_FILE})
+        # 写真（任意）を先に外し、音声（主）は残す
+        self.assertEqual([c["mimes"] for c in calls], [["audio/ogg", "image/png"], ["audio/ogg"]])
+        self.assertEqual(self.store.get_record(a["record_id"])["transcript"], "孫から手紙が届いた")
+        self.assertNotIn("audio_error", a["response"])
+
+    def test_photo_without_text_still_falls_back_when_audio_also_rejected(self):
+        # 写真・音声とも恒常的エラーで、文字も無ければ従来どおり次のモデルへ（全滅ならモック）
+        bad = analysis.GeminiHTTPError(400, "bad")
+        a, calls = self._analyze({self.PRIMARY: [bad], self.FALLBACK: [bad]}, gratitude="", mood="",
+                                 files={"audio": ("memo.webm", b"0" * 50, "audio/webm"), **PHOTO_FILE})
+        self.assertEqual([c["mimes"] for c in calls],
+                         [["audio/webm", "image/png"], ["audio/webm"]] * 2)
+        self.assertEqual(a["fallback_reason"], "gemini_error")
+        self.assertEqual(a["kind"], "voice_notice")
+
+    def test_appearance_comments_rejected(self):
+        for word in ("「庭のバラ」の日。写真では少し痩せたように見えますね。",
+                     "「庭のバラ」の日。写真のあなたは少し老けた感じがします。",
+                     "「庭のバラ」の日。顔色が悪いのが気になります。",
+                     "「庭のバラ」の日。目の下のクマが写っていますね。",
+                     "「庭のバラ」の日。少しふっくらされたでしょうか？"):
+            a, _ = self._analyze({self.PRIMARY: [{"todays_word": word, "observations": []}]}, files=PHOTO_FILE)
+            self.assertEqual(a["engine"], "mock (guard fallback)", word)
+            self.assertEqual(a["fallback_reason"], "guard_appearance", word)
+            self.assertNotEqual(a["todays_word"], word)
+            self.assertIn("庭のバラ", a["todays_word"])
+            self.assertFalse(a["response"]["photo"]["used_in_output"])
+            self.assertTrue(a["response"]["photo"]["sent_to_gemini"])
+        # 観察文の外見コメントも止める（写真が無くても）
+        a, _ = self._analyze({self.PRIMARY: [{"todays_word": "「庭のバラ」の日。",
+                                              "observations": ["写真：やつれた表情に見えます"]}]})
+        self.assertEqual(a["fallback_reason"], "guard_appearance")
+
+    def test_user_own_appearance_words_quoted_are_allowed(self):
+        # 本人が書いた「体重」をそのまま引用しただけなら弾かない（AI 自身の外見コメントではない）
+        a, _ = self._analyze({self.PRIMARY: [{"todays_word": "「体重計に乗れた」ことに目が向いた今日。",
+                                              "observations": []}]},
+                             gratitude="体重計に乗れた", mood="まあまあ")
+        self.assertEqual(a["engine"], "gemini", a["response"].get("guard"))
+
+    def test_mock_texts_have_no_appearance_words(self):
+        # モックのテンプレート・定型文・プロンプトの例文が (g) に当たらない
+        for g, m in (("庭のバラ", "元気だけど眠い"), ("", "疲れた"), ("散歩", "まあまあ元気"), ("娘の電話", "")):
+            for turn in range(3):
+                w = analysis._mirror_word(g, m, "", turn)
+                self.assertEqual(analysis.find_appearance_words(w), [], w)
+        self.assertEqual(analysis.find_appearance_words(analysis.PHOTO_RECEIVED_OBSERVATION), [])
+        self.assertEqual(analysis.find_appearance_words(PHOTO_WORD["todays_word"], *PHOTO_WORD["observations"]), [])
+        # 写真に写った物の様子は止めない
+        self.assertEqual(analysis.find_appearance_words("写真には、クマのぬいぐるみと明るい窓が写っていますね。"), [])
+
+    def test_no_photo_flow_unchanged(self):
+        a, calls = self._analyze({self.PRIMARY: [OK_WORD]})
+        self.assertEqual(len(calls[0]["mimes"]), 0)
+        self.assertEqual(a["response"]["gemini_attempts"],
+                         [{"model": self.PRIMARY, "input": "text", "attempt": 1, "ok": True}])
+        self.assertNotIn("photo", a["response"])
+        self.assertNotIn("photo_included", a["response"])
+        self.assertFalse(a["request"]["inputs"]["has_photo"])
+        self.assertIsNone(a["request"]["inputs"]["photo_mime"])
+        self.assertNotIn(analysis.PHOTO_RECEIVED_OBSERVATION, a["observations"])
+        # プロンプトは写真の指示が無いだけで、従来と同じ
+        req = a["request"]
+        self.assertNotIn(analysis.PHOTO_RULES, analysis._gemini_prompt(req, False))
+        self.assertEqual(analysis._gemini_prompt(req, False), analysis._gemini_prompt(req, False, False))
+        os.environ.pop("GEMINI_API_KEY")
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        m = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertNotIn("photo", m["response"])
+        self.assertNotIn("photo_note", m["response"])
+
+    def test_mock_mentions_photo_arrival_only(self):
+        os.environ.pop("GEMINI_API_KEY")
+        rec = self.post_record(gratitude="庭のバラ", mood="元気", files=PHOTO_FILE).json()
+        with_photo = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(with_photo["engine"], "mock")
+        self.assertIn(analysis.PHOTO_RECEIVED_OBSERVATION, with_photo["observations"])  # ベースライン中の定型文
+        self.assertNotIn("写真", with_photo["todays_word"])  # 一言で写真の中身に触れない
+        self.assertFalse(with_photo["response"]["photo"]["sent_to_gemini"])
+        self.assertIn("中身を見ていません", with_photo["response"]["photo_note"])
+        # 同じ言葉なら、一言は写真の有無で変わらない（決定的）
+        no_photo = analysis._analyze_mock({**self.store.get_record(rec["id"]), "photo_path": None}, 1, None)
+        self.assertEqual(with_photo["todays_word"], no_photo["todays_word"])
+
+    def test_mock_after_baseline_and_on_gemini_error(self):
+        os.environ.pop("GEMINI_API_KEY")
+        self.seed_days("mother", [("庭のバラがきれいに咲いて眺めていられたこと", "よく休めて体も軽く元気です")] * 7,
+                       end=self.today - timedelta(days=1))
+        rec = self.post_record(gratitude="庭のバラ", mood="元気", files=PHOTO_FILE).json()
+        a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(a["baseline_day"], 8)
+        self.assertEqual(a["observations"].count(analysis.PHOTO_RECEIVED_OBSERVATION), 1)
+        # Gemini が全滅してモックに落ちたときも、写真は「届いた」とだけ書く
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        a, calls = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [E503]}, files=PHOTO_FILE)
+        self.assertEqual(a["fallback_reason"], "gemini_error")
+        self.assertTrue(all(c["mimes"] == ["image/png"] for c in calls))
+        self.assertEqual(a["observations"].count(analysis.PHOTO_RECEIVED_OBSERVATION), 1)
+        photo = a["response"]["photo"]
+        self.assertTrue(photo["tried_with_photo"])
+        self.assertFalse(photo["sent_to_gemini"])
+
+    def test_gemini_photo_observation_kept_after_baseline(self):
+        os.environ.pop("GEMINI_API_KEY")
+        self.seed_days("mother", [("庭のバラがきれいに咲いて眺めていられたこと", "よく休めて体も軽く元気です")] * 7,
+                       end=self.today - timedelta(days=1))
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        a, _ = self._analyze({self.PRIMARY: [PHOTO_WORD]}, files=PHOTO_FILE)
+        self.assertEqual(a["engine"], "gemini")
+        self.assertIn("写真：窓からの光が部屋を明るくしています", a["observations"])
+        self.assertNotIn(analysis.PHOTO_RECEIVED_OBSERVATION, a["observations"])  # Gemini が見たときは定型文を足さない
 
 
 # --------------------------------------------------------------------------

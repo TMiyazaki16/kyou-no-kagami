@@ -17,7 +17,23 @@ const FALLBACK_TEXT: Record<string, string> = {
     "最初の7日間なのに、Gemini の一言が変化に触れていた（「いつもより」「最近」など）ため不採用とし、ローカルモックに差し替えました。",
   guard_assertive:
     "Gemini の出力が疲れ・体調を言い切っていた（「疲れているようです」など）ため不採用とし、ローカルモックに差し替えました。",
+  guard_appearance:
+    "Gemini の出力が外見に触れていた（「痩せた」「顔色」など）ため不採用とし、ローカルモックに差し替えました。",
 };
+
+/** レスポンスの photo（写真があった記録だけ）を1行の説明にする */
+type PhotoStatus = { sent_to_gemini?: boolean; used_in_output?: boolean; dropped_error?: string | null };
+
+function photoText(photo: PhotoStatus | undefined): string | null {
+  if (!photo) return null;
+  if (photo.used_in_output)
+    return "写真も Gemini への入力に含めました（試行ログの input が「+photo」）。写真から拾うのは様子だけで、外見には触れません。";
+  if (photo.sent_to_gemini)
+    return "写真も Gemini に渡しましたが、出力はガードで不採用になったため、写真の中身は反映していません。";
+  if (photo.dropped_error)
+    return "Gemini が写真を受け付けなかったため、写真を外して言葉（と声）だけで解析しました。";
+  return "写真は届いていますが、この解析では写真の中身を見ていません（ローカルモック）。";
+}
 
 export function DevView() {
   const [dev, setDev] = useState<DevLatest | null>(null);
@@ -47,6 +63,7 @@ export function DevView() {
     : isGemini
     ? `Gemini API（${String((ana.request as { model?: string }).model ?? dev?.gemini_model)}）で生成し、サーバー側のガード（NG語・引用チェック）を通過しました。`
     : FALLBACK_TEXT[ana.fallback_reason] ?? "ローカルモックで生成しました。";
+  const photoLine = photoText(ana.response.photo as PhotoStatus | undefined);
 
   return (
     <section>
@@ -57,6 +74,7 @@ export function DevView() {
           <span className={isGemini ? "badge gemini" : "badge mock"}>{ana.engine}</span>
         </p>
         <p className="muted">{explanation}</p>
+        {photoLine && <p className="muted">{photoLine}</p>}
         {ana.kind === "voice_notice" && (
           <p className="muted">文字の入力も文字起こしもなかったため、汎用文は出さずに案内文を返しました。</p>
         )}
