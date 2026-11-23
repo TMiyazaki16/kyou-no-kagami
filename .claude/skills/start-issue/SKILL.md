@@ -46,9 +46,9 @@ description: Issue 番号から、命名規則どおりの作業ブランチ（<
 5. **main の最新から切る。**
    ```sh
    git fetch origin <既定ブランチ>
-   git switch -c <ブランチ名> origin/<既定ブランチ>
+   git switch -c <ブランチ名> --no-track origin/<既定ブランチ>
    ```
-   この時点では push しない（push は `open-pr` で行う）。
+   `--no-track` を付けて、upstream が `origin/<既定ブランチ>` にならないようにする（付けないと `git status` が main との差を表示し、`git push` の行き先も紛らわしくなる）。upstream は `open-pr` の `git push -u origin <ブランチ名>` で設定される。この時点では push しない。
 
 6. **報告する**：ブランチ名、Issue の受け入れ条件の要約、実装の方針（3 ファイル以上にまたがるなら `AGENTS.md` に従って計画を先に提示する）。
 

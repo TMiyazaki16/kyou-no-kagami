@@ -23,12 +23,13 @@ description: Issue ブランチの変更を検証 → commit → push し、Clos
 
 2. **検証する**：`<検証スキル>` を実行し、すべて通ることを確かめる。通らなければ PR を作らず、失敗内容を報告する（Deroshi が「途中経過を draft で」と指示したときだけ `--draft` で作り、未通過を本文に明記する）。
 
-3. **差分を点検する。**
+3. **差分を点検する（commit 前）。**
    ```sh
    git status
-   git diff
-   git diff --name-only origin/<既定ブランチ>...HEAD
+   git diff            # 未 stage の変更
+   git diff --cached   # stage 済みの変更
    ```
+   commit 前は `origin/<既定ブランチ>...HEAD` を見ても未コミットの変更は出ないので、ここでは作業ツリーと stage を見る。
    - `<変更禁止パス>`（例：`.github/workflows/`）が含まれていたら止めて報告する
    - 秘密を含むファイル（`.env`、`*.tfvars`、`backend.hcl`、`*.tfplan`、鍵 JSON、DB ファイル、トークン）を含めない
    - Issue の「対象外」に当たる変更、無関係な整形差分を含めない
@@ -39,6 +40,13 @@ description: Issue ブランチの変更を検証 → commit → push し、Clos
    git commit -m "<変更の要約> (#<番号>)" -m "<補足（何を・なぜ）>"
    ```
    作業環境が commit の署名行（Co-Authored-By など）を指定していれば、それに従って末尾に付ける。
+
+   commit 後に、ブランチ全体の差分（PR に載るファイル）を確かめる。
+   ```sh
+   git diff --name-only origin/<既定ブランチ>...HEAD
+   git status --porcelain   # stage し忘れが無いこと
+   ```
+   手順 3 の基準（変更禁止パス・秘密・対象外）に当たるファイルがあれば push せずに止めて報告する。
 
 5. **push する。**
    ```sh
