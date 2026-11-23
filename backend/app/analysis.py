@@ -3,6 +3,9 @@
 Two engines:
 - "gemini": used when env GEMINI_API_KEY is set. Calls the Gemini API.
             音声があれば inline_data で渡し、文字起こしと一言の生成を1回の呼び出しで行う。
+            主モデル（GEMINI_MODEL）→ 代替モデル（GEMINI_FALLBACK_MODEL）の順に呼び、
+            503・429・5xx・タイムアウト等の一次的エラーは各モデルで短い指数バックオフで再試行する。
+            全滅したらモックに落とす（fallback_reason = "gemini_error"）。
 - "mock":   deterministic local fallback. Still references the SPECIFIC words
             of that day's memo (the gratitude content and the mood phrase),
             never generic encouragement.
@@ -27,6 +30,8 @@ import hashlib
 import json
 import os
 import re
+import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -34,6 +39,21 @@ from . import rules
 
 BASELINE_DAYS = rules.BASELINE_DAYS
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
+
+# 一次的エラー（503・429・5xx・タイムアウト等）の再試行。主モデル → 代替モデル → モックの順に落とす。
+# 間隔は短く保つ：503 の多くは数秒で回復する一方、nginx の proxy_read_timeout（120s）以内に
+# 解析全体を終える必要があるため。
+GEMINI_MAX_RETRIES = 2              # 各モデルの再試行回数（初回を含めて最大3回）
+GEMINI_BACKOFF_SEC = (1.0, 2.0)     # 再試行前の待ち（指数バックオフ：1s → 2s）。1モデルあたり最大 3s
+GEMINI_CALL_TIMEOUT_SEC = 25.0      # 1回の呼び出しのタイムアウト（Lite 系は音声込みでも数秒で返る）
+GEMINI_TOTAL_BUDGET_SEC = 100.0     # Gemini 全体（全モデル・全再試行）の上限。残りをモデル数で等分する
+_MIN_ATTEMPT_SEC = 3.0              # 残り時間がこれ未満なら、そのモデルではもう呼ばない
+_TRANSIENT_HTTP = {408, 429}        # 5xx に加えて一次的とみなす HTTP ステータス
+
+# テストで差し替える（実時間スリープしない）
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 # The only health-related wording the AI may ever produce (fixed phrase).
 FIXED_CARE_PHRASE = "気になることが続くときは、かかりつけの先生にも相談してみてくださいね。"
@@ -79,6 +99,16 @@ def _short(text: str, limit: int = 40) -> str:
 
 def gemini_model() -> str:
     return os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
+
+
+def gemini_fallback_model() -> str:
+    return os.environ.get("GEMINI_FALLBACK_MODEL", "").strip() or DEFAULT_GEMINI_FALLBACK_MODEL
+
+
+def gemini_models() -> list[str]:
+    """呼び出し順（主モデル → 代替モデル）。同じ名前なら1回だけ。"""
+    primary, fallback = gemini_model(), gemini_fallback_model()
+    return [primary] if fallback == primary else [primary, fallback]
 
 
 # --------------------------------------------------------------------------
@@ -193,15 +223,32 @@ def analyze(
 
     result: dict | None = None
     if api_key:
-        request["model"] = gemini_model()
-        try:
-            g = _analyze_gemini(api_key, request, record, audio)
-        except Exception as exc:  # fall back to mock, but say so in the dev view
+        models = gemini_models()
+        request["model_chain"] = models
+        request["model"] = models[0]
+        attempts: list[dict] = []
+        g, last_error = None, None
+        start = _monotonic()
+        for i, model in enumerate(models):
+            # 残り時間をまだ試していないモデルで等分する（主モデルが粘っても代替に時間を残す）
+            remaining = GEMINI_TOTAL_BUDGET_SEC - (_monotonic() - start)
+            deadline = _monotonic() + remaining / (len(models) - i)
+            try:
+                g = _analyze_gemini(api_key, request, record, audio, model, deadline, attempts)
+                break
+            except Exception as exc:  # 次のモデルへ。全滅したらモック
+                last_error = exc
+        if g is None:  # fall back to mock, but say so in the dev view
             result = _analyze_mock(record, baseline_day, previous)
             result["engine"] = "mock (gemini-error fallback)"
             result["fallback_reason"] = "gemini_error"
-            result["response"]["gemini_error"] = _redact(str(exc), api_key)
+            result["response"]["gemini_error"] = _redact(str(last_error), api_key)
+            result["response"]["gemini_attempts"] = attempts
         else:
+            # 「仕組みを見る」が表示するモデル名は、実際に応答したモデルにする
+            request["model"] = g["response"]["model"]
+            g["response"]["gemini_attempts"] = attempts
+            # ガードは、どのモデルが応答しても同じものを通す
             result = _apply_guards(g, record, baseline_day, previous)
     else:
         result = _analyze_mock(record, baseline_day, previous)
@@ -380,7 +427,28 @@ def _gemini_prompt(request: dict, with_audio: bool) -> str:
     )
 
 
-def _call_gemini(api_key: str, model: str, parts: list[dict]) -> dict:
+class GeminiHTTPError(RuntimeError):
+    """Gemini API の HTTP エラー。status で一次的か恒常的かを分ける。"""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}: {detail}")
+        self.status = status
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """再試行して意味がある一次的エラーか（503・429・5xx・タイムアウト・接続断）。"""
+    if isinstance(exc, GeminiHTTPError):
+        return exc.status in _TRANSIENT_HTTP or exc.status >= 500
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _TRANSIENT_HTTP or exc.code >= 500
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):  # DNS 失敗・接続拒否・読み取りタイムアウト等
+        return True
+    return False
+
+
+def _call_gemini(api_key: str, model: str, parts: list[dict], timeout: float = GEMINI_CALL_TIMEOUT_SEC) -> dict:
     body = {
         "contents": [{"parts": parts}],
         "generationConfig": {"responseMimeType": "application/json"},
@@ -392,15 +460,47 @@ def _call_gemini(api_key: str, model: str, parts: list[dict]) -> dict:
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:500]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from None
+        raise GeminiHTTPError(exc.code, detail) from None
 
 
-def _analyze_gemini(api_key: str, request: dict, record: dict, audio: tuple[bytes, str] | None) -> dict:
-    model = request.get("model") or gemini_model()
+def _call_with_retry(api_key: str, model: str, parts: list[dict], deadline: float,
+                     attempts: list[dict], label: str) -> dict:
+    """1モデルへの呼び出し。一次的エラーだけ指数バックオフで再試行する（最大 GEMINI_MAX_RETRIES 回）。
+    恒常的エラー（400・404 等）と、再試行を使い切った／時間切れの一次的エラーはそのまま投げる。"""
+    for n in range(GEMINI_MAX_RETRIES + 1):
+        remaining = deadline - _monotonic()
+        try:
+            if remaining < _MIN_ATTEMPT_SEC:
+                raise TimeoutError(f"time budget exhausted before attempt {n + 1}")
+            raw = _call_gemini(api_key, model, parts, timeout=min(GEMINI_CALL_TIMEOUT_SEC, remaining))
+        except Exception as exc:
+            transient = _is_transient(exc)
+            entry = {"model": model, "input": label, "attempt": n + 1, "ok": False,
+                     "transient": transient, "error": _redact(str(exc), api_key)[:300]}
+            attempts.append(entry)
+            if not transient or n >= GEMINI_MAX_RETRIES:
+                raise
+            wait = GEMINI_BACKOFF_SEC[min(n, len(GEMINI_BACKOFF_SEC) - 1)]
+            if deadline - _monotonic() - wait < _MIN_ATTEMPT_SEC:
+                raise  # 待っても次を呼ぶ時間が残らない
+            entry["retry_after_sec"] = wait
+            _sleep(wait)
+        else:
+            attempts.append({"model": model, "input": label, "attempt": n + 1, "ok": True})
+            return raw
+    raise AssertionError("unreachable")
+
+
+def _analyze_gemini(api_key: str, request: dict, record: dict, audio: tuple[bytes, str] | None,
+                    model: str | None = None, deadline: float | None = None,
+                    attempts: list[dict] | None = None) -> dict:
+    model = model or request.get("model") or gemini_model()
+    deadline = deadline if deadline is not None else _monotonic() + GEMINI_TOTAL_BUDGET_SEC
+    attempts = attempts if attempts is not None else []
     audio_ok = bool(audio) and audio[1] in AUDIO_MIMES  # type: ignore[index]
     audio_error = None
     raw = None
@@ -411,14 +511,18 @@ def _analyze_gemini(api_key: str, request: dict, record: dict, audio: tuple[byte
             {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
         ]
         try:
-            raw = _call_gemini(api_key, model, parts)
+            raw = _call_with_retry(api_key, model, parts, deadline, attempts, "text+audio")
         except Exception as exc:
+            # 一次的エラー（混雑）を使い切ったときは、音声のまま次のモデルへ
+            if _is_transient(exc):
+                raise
             # 音声形式を受け付けない等。文字があれば文字だけで再試行する
             audio_error = _redact(str(exc), api_key)
             if not (record.get("gratitude") or record.get("mood")):
                 raise
     if raw is None:
-        raw = _call_gemini(api_key, model, [{"text": _gemini_prompt(request, False)}])
+        raw = _call_with_retry(api_key, model, [{"text": _gemini_prompt(request, False)}],
+                               deadline, attempts, "text")
     text = raw["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(text)
     response = {"engine": "gemini", "model": model, "raw": raw, "parsed": parsed}

@@ -35,7 +35,7 @@ def fake_gemini(payload: dict):
     """_call_gemini の差し替え。呼び出し引数を記録し、指定の JSON を返す。"""
     calls: list = []
 
-    def _call(api_key, model, parts):
+    def _call(api_key, model, parts, timeout=None):
         calls.append({"api_key": api_key, "model": model, "parts": parts})
         return {"candidates": [{"content": {"parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}}]}
 
@@ -54,6 +54,11 @@ class Base(unittest.TestCase):
         self.env_patch.start()
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("GEMINI_MODEL", None)
+        os.environ.pop("GEMINI_FALLBACK_MODEL", None)
+        # Gemini の再試行の待ちは実時間で眠らず、待った秒数だけ記録する
+        self.sleeps: list = []
+        self.sleep_patch = mock.patch.object(analysis, "_sleep", self.sleeps.append)
+        self.sleep_patch.start()
         # テストではハッシュの反復回数を下げて速くする（既定値は TestAuth で確認）
         self.iter_patch = mock.patch.object(auth, "PBKDF2_ITERATIONS", 1000)
         self.iter_patch.start()
@@ -71,6 +76,7 @@ class Base(unittest.TestCase):
         self.today_patch.stop()
         self.env_patch.stop()
         self.iter_patch.stop()
+        self.sleep_patch.stop()
 
     def register(self, name, email, password="password-123"):
         r = self.anon.post("/api/auth/register",
@@ -507,7 +513,7 @@ class TestGeminiPath(Base):
         self.assertEqual(a["engine"], "gemini")
 
     def test_gemini_error_reason_and_key_redacted(self):
-        def boom(api_key, model, parts):
+        def boom(api_key, model, parts, timeout=None):
             raise RuntimeError(f"HTTP 404: model not found (key={api_key})")
 
         rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
@@ -532,6 +538,190 @@ class TestGeminiPath(Base):
         self.assertEqual(a["baseline_day"], 9)
         self.assertEqual(a["observations"][-1], analysis.FIXED_CARE_PHRASE)
         self.assertTrue(any("『眠い』" in o for o in a["observations"]))
+
+
+# --------------------------------------------------------------------------
+def scripted_gemini(script: dict):
+    """モデル名ごとに、呼ばれるたびの結果（例外 or 返す JSON）を順に返す _call_gemini の差し替え。"""
+    calls: list = []
+    counters: dict = {}
+
+    def _call(api_key, model, parts, timeout=None):
+        calls.append({"model": model, "audio": any("inline_data" in p for p in parts), "timeout": timeout})
+        i = counters.get(model, 0)
+        counters[model] = i + 1
+        seq = script.get(model, [])
+        item = seq[min(i, len(seq) - 1)] if seq else analysis.GeminiHTTPError(404, "unknown model")
+        if isinstance(item, BaseException):
+            raise item
+        return {"candidates": [{"content": {"parts": [{"text": json.dumps(item, ensure_ascii=False)}]}}]}
+
+    return _call, calls
+
+
+OK_WORD = {"todays_word": "「庭のバラ」に心が動いた今日。", "observations": []}
+E503 = analysis.GeminiHTTPError(503, "The model is overloaded (high demand)")
+
+
+class TestGeminiFallback(Base):
+    PRIMARY = analysis.DEFAULT_GEMINI_MODEL
+    FALLBACK = analysis.DEFAULT_GEMINI_FALLBACK_MODEL
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+
+    def _analyze(self, script, files=None, **fields):
+        fields.setdefault("gratitude", "庭のバラ")
+        fields.setdefault("mood", "元気")
+        call, calls = scripted_gemini(script)
+        rec = self.post_record(files=files, **fields).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        return a, calls
+
+    def test_defaults(self):
+        self.assertEqual(self.PRIMARY, "gemini-3.5-flash-lite")
+        self.assertEqual(self.FALLBACK, "gemini-3.1-flash-lite")
+        self.assertEqual(analysis.gemini_models(), [self.PRIMARY, self.FALLBACK])
+        os.environ["GEMINI_FALLBACK_MODEL"] = "gemini-x"
+        self.assertEqual(analysis.gemini_models(), [self.PRIMARY, "gemini-x"])
+        os.environ["GEMINI_FALLBACK_MODEL"] = self.PRIMARY  # 同じなら1回だけ
+        self.assertEqual(analysis.gemini_models(), [self.PRIMARY])
+
+    def test_primary_success_does_not_use_fallback(self):
+        a, calls = self._analyze({self.PRIMARY: [OK_WORD], self.FALLBACK: [OK_WORD]})
+        self.assertEqual([c["model"] for c in calls], [self.PRIMARY])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["request"]["model"], self.PRIMARY)
+        self.assertEqual(a["request"]["model_chain"], [self.PRIMARY, self.FALLBACK])
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(a["response"]["gemini_attempts"],
+                         [{"model": self.PRIMARY, "input": "text", "attempt": 1, "ok": True}])
+
+    def test_primary_503_retried_then_success(self):
+        a, calls = self._analyze({self.PRIMARY: [E503, OK_WORD]})
+        self.assertEqual([c["model"] for c in calls], [self.PRIMARY, self.PRIMARY])
+        self.assertEqual(self.sleeps, [1.0])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["request"]["model"], self.PRIMARY)
+
+    def test_primary_503_then_fallback_success(self):
+        a, calls = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [OK_WORD]})
+        # 主モデルは初回＋再試行2回、その後に代替モデル
+        self.assertEqual([c["model"] for c in calls], [self.PRIMARY] * 3 + [self.FALLBACK])
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["fallback_reason"], "")
+        self.assertEqual(a["todays_word"], OK_WORD["todays_word"])
+        # 「仕組みを見る」が表示するモデル名（request.model）は、実際に応答した代替モデル
+        self.assertEqual(a["request"]["model"], self.FALLBACK)
+        self.assertEqual(a["response"]["model"], self.FALLBACK)
+        attempts = a["response"]["gemini_attempts"]
+        self.assertEqual([(x["model"], x["ok"]) for x in attempts],
+                         [(self.PRIMARY, False)] * 3 + [(self.FALLBACK, True)])
+        self.assertTrue(all(x["transient"] for x in attempts[:3]))
+        dev = self.c.get("/api/dev/latest-analysis").json()
+        self.assertEqual(dev["analysis"]["request"]["model"], self.FALLBACK)
+
+    def test_permanent_error_not_retried(self):
+        a, calls = self._analyze({self.PRIMARY: [analysis.GeminiHTTPError(400, "bad request")],
+                                  self.FALLBACK: [OK_WORD]})
+        self.assertEqual([c["model"] for c in calls], [self.PRIMARY, self.FALLBACK])
+        self.assertEqual(self.sleeps, [])
+        self.assertFalse(a["response"]["gemini_attempts"][0]["transient"])
+        self.assertEqual(a["request"]["model"], self.FALLBACK)
+
+    def test_transient_classification(self):
+        t = analysis._is_transient
+        for status in (408, 429, 500, 502, 503, 504):
+            self.assertTrue(t(analysis.GeminiHTTPError(status, "")), status)
+        for status in (400, 401, 403, 404):
+            self.assertFalse(t(analysis.GeminiHTTPError(status, "")), status)
+        self.assertTrue(t(TimeoutError("timed out")))
+        self.assertTrue(t(ConnectionResetError()))
+        import urllib.error
+        self.assertTrue(t(urllib.error.URLError("timed out")))
+        self.assertFalse(t(ValueError("bad json")))
+        self.assertFalse(t(KeyError("candidates")))
+
+    def test_timeout_and_429_are_retried(self):
+        a, calls = self._analyze({self.PRIMARY: [TimeoutError("timed out"),
+                                                 analysis.GeminiHTTPError(429, "rate"), OK_WORD]})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertTrue(all(c["timeout"] <= analysis.GEMINI_CALL_TIMEOUT_SEC for c in calls))
+
+    def test_all_fail_falls_back_to_mock(self):
+        a, calls = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [E503]})
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(self.sleeps, [1.0, 2.0, 1.0, 2.0])
+        self.assertLessEqual(sum(self.sleeps), 6.0)
+        self.assertEqual(a["engine"], "mock (gemini-error fallback)")
+        self.assertEqual(a["fallback_reason"], "gemini_error")
+        self.assertIn("庭のバラ", a["todays_word"])  # モックでも本人の言葉を引用
+        self.assertIn("HTTP 503", a["response"]["gemini_error"])
+        self.assertEqual(len(a["response"]["gemini_attempts"]), 6)
+        self.assertNotIn("test-key-SECRET", json.dumps(a, ensure_ascii=False))
+
+    def test_unparseable_response_moves_to_fallback(self):
+        a, calls = self._analyze({self.PRIMARY: [KeyError("candidates")], self.FALLBACK: [OK_WORD]})
+        self.assertEqual([c["model"] for c in calls], [self.PRIMARY, self.FALLBACK])
+        self.assertEqual(a["engine"], "gemini")
+
+    def test_guard_applies_to_fallback_response(self):
+        bad = {"todays_word": "「庭のバラ」の日。念のため病院に行ってみては。", "observations": []}
+        a, _ = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [bad]})
+        self.assertEqual(a["engine"], "mock (guard fallback)")
+        self.assertEqual(a["fallback_reason"], "guard_ng_word")
+        self.assertNotIn("病院", a["todays_word"])
+        self.assertEqual(a["response"]["gemini"]["model"], self.FALLBACK)
+        no_quote = {"todays_word": "今日もよくがんばりましたね。", "observations": []}
+        a, _ = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [no_quote]})
+        self.assertEqual(a["fallback_reason"], "guard_no_quote")
+
+    def test_audio_transient_goes_to_fallback_with_audio(self):
+        audio = b"OggS" + b"0" * 200
+        ok = {"transcript": "孫から手紙が届いた", "todays_word": "「孫から手紙が届いた」一日。", "observations": []}
+        a, calls = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [ok]},
+                                 files={"audio": ("memo.ogg", audio, "audio/ogg")})
+        # 混雑で失敗した音声は、文字だけに落とさず音声のまま代替モデルへ
+        self.assertEqual([(c["model"], c["audio"]) for c in calls],
+                         [(self.PRIMARY, True)] * 3 + [(self.FALLBACK, True)])
+        self.assertEqual(self.store.get_record(a["record_id"])["transcript"], "孫から手紙が届いた")
+        self.assertEqual(a["request"]["model"], self.FALLBACK)
+
+    def test_audio_permanent_error_retries_text_on_same_model(self):
+        audio = b"0" * 50
+        a, calls = self._analyze({self.PRIMARY: [analysis.GeminiHTTPError(400, "unsupported mime"), OK_WORD]},
+                                 files={"audio": ("memo.webm", audio, "audio/webm")})
+        self.assertEqual([(c["model"], c["audio"]) for c in calls], [(self.PRIMARY, True), (self.PRIMARY, False)])
+        self.assertIn("HTTP 400", a["response"]["audio_error"])
+        self.assertEqual(a["engine"], "gemini")
+
+    def test_time_budget_caps_waiting(self):
+        # 時計を進める呼び出し：毎回タイムアウトまで待たされたことにする
+        clock = [0.0]
+
+        def slow(api_key, model, parts, timeout=None):
+            clock[0] += timeout
+            raise TimeoutError("timed out")
+
+        def sleep(sec):
+            self.sleeps.append(sec)
+            clock[0] += sec
+
+        with mock.patch.object(analysis, "_monotonic", lambda: clock[0]), \
+                mock.patch.object(analysis, "_sleep", sleep), \
+                mock.patch.object(analysis, "_call_gemini", slow):
+            rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(a["fallback_reason"], "gemini_error")
+        self.assertLessEqual(clock[0], analysis.GEMINI_TOTAL_BUDGET_SEC)
+        # 主モデルが時間を使い切っても、代替モデルにも呼び出しの時間が残っている
+        models = [x["model"] for x in a["response"]["gemini_attempts"]]
+        self.assertIn(self.FALLBACK, models)
 
 
 # --------------------------------------------------------------------------
