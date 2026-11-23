@@ -72,8 +72,27 @@ export interface Share {
   sent_at: string | null;
   from_name: string;
   to_name: string;
+  /** 本人が「写真も一緒に届ける」をオンにして送った便りだけ。それ以外は null */
+  photo_url?: string | null;
+  /** 書いた本人向けの応答（下書き・送信）だけ：もとの記録の写真（トグルの表示用） */
+  record_photo_url?: string | null;
+  /** リアクション（旧スタンプを含む）。人×種類ごとに1つ */
   stamps?: Stamp[];
+  /** テキスト返信（古い順） */
+  replies?: Reply[];
 }
+
+export interface Reply {
+  id: number;
+  share_id: number;
+  from_user: string;
+  from_name?: string;
+  body: string;
+  created_at: string;
+}
+
+/** 返信の上限（サーバーの REPLY_MAX_CHARS と同じ。文字は code point で数える） */
+export const REPLY_MAX_CHARS = 200;
 
 export interface Stamp {
   id: number;
@@ -184,8 +203,14 @@ export const api = {
     send<Share>("/api/shares/draft", { to_user: toUser ?? null, record_id: recordId ?? null }),
   editShare: (shareId: number, finalText: string) =>
     send<Share>(`/api/shares/${shareId}`, { final_text: finalText }, "PATCH"),
-  sendShare: (shareId: number, finalText: string) =>
-    send<Share>(`/api/shares/${shareId}/send`, { final_text: finalText }),
+  sendShare: (shareId: number, finalText: string, includePhoto = false) =>
+    send<Share>(`/api/shares/${shareId}/send`, { final_text: finalText, include_photo: includePhoto }),
   letters: () => get<Letters>("/api/letters"),
+  /** 旧版のスタンプ返信（付けるだけ）。画面はリアクション（toggleReaction）を使う */
   addStamp: (shareId: number, stamp: string) => send<Stamp>(`/api/letters/${shareId}/stamps`, { stamp }),
+  /** stamps はリアクションの種類（「いいね」＋旧スタンプ） */
+  toggleReaction: (shareId: number, reaction: string) =>
+    send<{ reaction: string; on: boolean; letter: Share }>(`/api/letters/${shareId}/reactions`, { reaction }),
+  addReply: (shareId: number, text: string) =>
+    send<{ reply: Reply; letter: Share }>(`/api/letters/${shareId}/replies`, { text }),
 };

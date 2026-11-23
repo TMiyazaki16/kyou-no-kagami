@@ -75,6 +75,7 @@ MYSQL_SCHEMA = [
     status VARCHAR(16) NOT NULL DEFAULT 'draft',
     created_at VARCHAR(40) NOT NULL,
     sent_at VARCHAR(40) NULL,
+    photo_path VARCHAR(512) NULL,
     KEY idx_shares_from (from_user, status),
     KEY idx_shares_to (to_user, status)
 ) {_TABLE_OPTS}""",
@@ -85,6 +86,14 @@ MYSQL_SCHEMA = [
     stamp VARCHAR(64) NOT NULL,
     created_at VARCHAR(40) NOT NULL,
     KEY idx_stamps_share (share_id)
+) {_TABLE_OPTS}""",
+    f"""CREATE TABLE IF NOT EXISTS letter_replies (
+    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    share_id BIGINT NOT NULL,
+    from_user VARCHAR(64) NOT NULL,
+    body TEXT NOT NULL,
+    created_at VARCHAR(40) NOT NULL,
+    KEY idx_letter_replies_share (share_id)
 ) {_TABLE_OPTS}""",
     f"""CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -120,8 +129,12 @@ _MYSQL_ANALYSIS_EXTRA_COLUMNS = {
     "notice": "TEXT NOT NULL",
     "fallback_reason": "VARCHAR(64) NOT NULL DEFAULT ''",
 }
+# storage._SHARE_EXTRA_COLUMNS の MySQL 版
+_MYSQL_SHARE_EXTRA_COLUMNS = {
+    "photo_path": "VARCHAR(512) NULL",
+}
 
-APP_TABLES = ("stamps", "shares", "analyses", "records", "family_links", "sessions", "users")
+APP_TABLES = ("letter_replies", "stamps", "shares", "analyses", "records", "family_links", "sessions", "users")
 
 
 def mysql_settings_from_env() -> dict[str, Any]:
@@ -206,14 +219,16 @@ class MySQLStore(Store):
         with self._conn() as cur:
             for ddl in MYSQL_SCHEMA:
                 cur.execute(ddl)
-            cur.execute(
-                "SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS"
-                " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'analyses'"
-            )
-            cols = {r["name"] for r in cur.fetchall()}
-            for name, ddl in _MYSQL_ANALYSIS_EXTRA_COLUMNS.items():
-                if name not in cols:
-                    cur.execute(f"ALTER TABLE analyses ADD COLUMN {name} {ddl}")
+            for table, extra in (("analyses", _MYSQL_ANALYSIS_EXTRA_COLUMNS),
+                                 ("shares", _MYSQL_SHARE_EXTRA_COLUMNS)):
+                cur.execute(
+                    "SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS"
+                    " WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s", (table,)
+                )
+                cols = {r["name"] for r in cur.fetchall()}
+                for name, ddl in extra.items():
+                    if name not in cols:
+                        cur.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def reset_all(self) -> None:
         """全テーブルを空にする（seed_demo.py --reset 用。Store インターフェース外）。"""
@@ -455,7 +470,7 @@ class MySQLStore(Store):
         return self._one("SELECT * FROM shares WHERE id = %s", (share_id,))
 
     def update_share(self, share_id: int, fields: dict) -> dict | None:
-        allowed = {"final_text", "status", "sent_at"}
+        allowed = {"final_text", "status", "sent_at", "photo_path"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return self.get_share(share_id)
@@ -469,6 +484,7 @@ class MySQLStore(Store):
         rows = self._all(f"SELECT * FROM shares WHERE {column} = %s AND status = 'sent' ORDER BY id DESC", (user_id,))
         for letter in rows:
             letter["stamps"] = self.list_stamps(letter["id"])
+            letter["replies"] = self.list_replies(letter["id"])
         return rows
 
     def list_letters_for(self, user_id: str) -> list[dict]:
@@ -486,3 +502,26 @@ class MySQLStore(Store):
 
     def list_stamps(self, share_id: int) -> list[dict]:
         return self._all("SELECT * FROM stamps WHERE share_id = %s ORDER BY id ASC", (share_id,))
+
+    def toggle_stamp(self, share_id: int, from_user: str, stamp: str) -> bool:
+        with self._conn() as cur:
+            # 旧版の add_stamp で重なったものも含めてまとめて外す。stamps 表は旧データに重複がありうるので
+            # 一意制約は付けていない（同時の二度押しで重なっても、表示側で人×種類ごとに1つにまとめる）
+            removed = cur.execute("DELETE FROM stamps WHERE share_id = %s AND from_user = %s AND stamp = %s",
+                                  (share_id, from_user, stamp))
+            if removed:
+                return False
+            cur.execute("INSERT INTO stamps (share_id, from_user, stamp, created_at) VALUES (%s, %s, %s, %s)",
+                        (share_id, from_user, stamp, _now()))
+            return True
+
+    # ---- letter replies --------------------------------------------------
+    def add_reply(self, share_id: int, from_user: str, body: str) -> dict:
+        with self._conn() as cur:
+            cur.execute("INSERT INTO letter_replies (share_id, from_user, body, created_at) VALUES (%s, %s, %s, %s)",
+                        (share_id, from_user, body, _now()))
+            cur.execute("SELECT * FROM letter_replies WHERE id = %s", (cur.lastrowid,))
+            return cur.fetchone()
+
+    def list_replies(self, share_id: int) -> list[dict]:
+        return self._all("SELECT * FROM letter_replies WHERE share_id = %s ORDER BY id ASC", (share_id,))
