@@ -44,8 +44,8 @@ frontend/src/
   App.tsx             外枠のみ（ログイン確認・ヘッダー・ナビ・画面の切替）。画面の中身は書かない
   navigation.ts       Screen（画面ID）・NAV（ナビの並びと文言）・Ctx（各画面に渡す共通 props）
   screens/            1画面1ファイル（全10画面＋ログイン/登録 AuthScreen）。ファイル名＝コンポーネント名
-  components/         2画面以上で使う部品（WeeklyMessage）
-  lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText、audio.ts：録音形式）
+  components/         2画面以上・外枠で使う部品（WeeklyMessage、BottomTabs、DiaryBell＝ヘッダーの通知ベル）
+  lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText、audio.ts：録音形式、diarySeen.ts：通知バッジの既読時刻を localStorage に置く）
   api.ts              API クライアントと型。トークンを localStorage に置き Authorization ヘッダーで送る
 ```
 

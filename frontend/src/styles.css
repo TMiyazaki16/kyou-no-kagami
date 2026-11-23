@@ -17,7 +17,7 @@
   --primary-soft: #fbeee6;  /* 柿の淡色（選択中のチップなど） */
   --kagami: #27536b;        /* 藍鼠（淡色の上で 7.18:1） */
   --kagami-soft: #e8f0f4;
-  --letter: #fff3d6;        /* 山吹の淡色（届いた便り） */
+  --letter: #fff3d6;        /* 山吹の淡色（家族から届いた便り） */
   --letter-line: #ebcb86;
   --letter-ink: #6b4a0e;    /* 山吹の上の強調文字 7.29:1 */
   --safe: #235a2e;          /* 安心の緑 7.06:1 */
@@ -200,10 +200,11 @@ pre {
   margin: 0 calc(-1 * var(--space-4)); padding-left: var(--space-4); padding-right: var(--space-4);
   flex-wrap: nowrap;
 }
-.header-bar h1 { font-size: 20px; white-space: nowrap; }
+.header-bar h1 { font-size: 20px; white-space: nowrap; letter-spacing: 0.02em; }
 .header-bar .user-switch { min-width: 0; }
 .header-bar .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 9em; }
-.header-bar .user-switch button { min-height: 44px; padding: 4px 14px; font-size: 15px; font-weight: 600; color: var(--muted); }
+.header-bar .user-switch { gap: var(--space-1); }
+.header-bar .user-switch button { min-height: 44px; padding: 4px 8px; font-size: 15px; font-weight: 600; color: var(--muted); white-space: nowrap; }
 
 /* ---- 下部タブ ---------------------------------------------------- */
 .tabbar {
@@ -336,11 +337,11 @@ body.sheet-open { overflow: hidden; }
 .record-card .date { font-size: var(--fs-body); }
 .record-card .word { margin-top: var(--space-2); }
 
-/* ---- 届いた便り -------------------------------------------------- */
-.letter-card { background: var(--letter); border-color: var(--letter-line); padding: var(--space-5); }
-.letter-card .date { color: var(--letter-ink); }
+/* ---- 家族の日記（統合タイムライン、#15） ---------------------------- */
 .letter-body { font-size: var(--fs-body); line-height: 1.9; white-space: pre-wrap; }
-.stamp-chips { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); margin: var(--space-4) 0 var(--space-3); }
+.stamp-chips { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); margin: var(--space-3) 0; }
+.stamp-chips.given { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.stamp-chips.given .stamp-chip { min-height: 44px; padding: 4px 16px; }
 .stamp-chip {
   min-height: var(--btn-h-sub); border-radius: var(--radius-pill);
   background: var(--surface); border-color: var(--letter-line); color: var(--text);
@@ -348,12 +349,6 @@ body.sheet-open { overflow: hidden; }
 }
 .stamp-chip:hover { border-color: var(--primary); }
 .stamp-chip.active { background: var(--primary); border-color: var(--primary); color: #fff; }
-.sent-card .sent-body { padding-left: var(--space-3); border-left: 3px solid var(--line); }
-.replies { margin: var(--space-2) 0 0; }
-.reply-bubble {
-  position: relative; border-radius: 16px 16px 16px 4px;
-  padding: 6px 16px; font-size: var(--fs-body);
-}
 
 /* ---- PC で見たとき（デモ用）：タブを中央の幅にそろえる -------------- */
 @media (min-width: 700px) {
@@ -365,25 +360,28 @@ body.sheet-open { overflow: hidden; }
   * { transition: none !important; animation: none !important; }
 }
 
-/* ---- 届いた便り：写真・リアクション・返信（#13） -------------------- */
+/* ---- 家族の日記：写真・リアクション・返信（#13, #15） ---------------- */
 .letter-photo {
   display: block; width: 100%; max-height: 360px; object-fit: contain;
   background: var(--surface); border: 1px solid var(--letter-line); border-radius: var(--radius-m);
   margin: var(--space-3) 0 0;
 }
-.sent-card .letter-photo { border-color: var(--line); max-height: 240px; }
 .photo-caption { margin-top: var(--space-1); font-size: var(--fs-small); }
-.stamp-chip.like span { font-size: 20px; line-height: 1; }
-.reply-thread { list-style: none; padding: 0; margin: var(--space-3) 0 0; }
+/* 返信はスレッド：投稿の下に字下げし、左の線でつなぐ */
+.reply-thread {
+  list-style: none; padding: 0 0 0 var(--space-4); margin: var(--space-3) 0 0 22px;
+  border-left: 3px solid var(--letter-line);
+}
 .reply-item {
   background: var(--surface); border: 1px solid var(--letter-line);
   border-radius: 16px 16px 16px 4px; padding: var(--space-2) var(--space-4);
 }
-.sent-card .reply-item { background: var(--letter); }
+.post.mine .reply-thread { border-left-color: var(--line-strong); }
+.post.mine .reply-item { background: var(--letter); }
 .reply-item + .reply-item { margin-top: var(--space-2); }
 .reply-meta { margin: 0; color: var(--muted); font-size: var(--fs-small); }
 .reply-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.letter-card .reply-label { margin-top: var(--space-4); }
+.reply-box { margin-top: var(--space-3); }
 .reply-input { min-height: calc(1.7em * 2 + 24px); background: var(--surface); }
 .reply-actions {
   display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
@@ -398,3 +396,69 @@ body.sheet-open { overflow: hidden; }
 .toggle-label input[type="checkbox"] { width: 26px; height: 26px; min-height: 0; margin: 0; flex: none; accent-color: var(--primary); }
 .photo-toggle .muted { margin: var(--space-1) 0 0; }
 .share-photo { max-height: 240px; object-fit: contain; }
+
+/* ---- 家族の日記：投稿カード・アクションバー・通知ベル（#15） ------------ */
+.diary-lead { margin-top: calc(-1 * var(--space-2)); }
+.diary-feed { list-style: none; padding: 0; margin: 0 0 var(--space-4); }
+.diary-feed > li + li { margin-top: var(--space-4); }
+.post {
+  border: 1px solid var(--line); border-radius: var(--radius-l);
+  background: var(--surface); box-shadow: var(--shadow-card);
+  padding: var(--space-4) var(--space-5);
+}
+.post.family { background: var(--letter); border-color: var(--letter-line); }
+.post-head { display: flex; align-items: center; gap: var(--space-3); margin-bottom: var(--space-3); }
+.post-avatar {
+  flex: none; width: 44px; height: 44px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 20px;
+  background: var(--letter-ink); color: #fff;
+}
+.post-avatar.mine { background: var(--kagami); }
+.post-meta { margin: 0; line-height: 1.5; }
+.post-name { font-weight: 700; }
+.post-you, .post-to, .post-date { color: var(--muted); font-size: var(--fs-small); }
+.post.family .post-to, .post.family .post-date { color: var(--letter-ink); }
+.post-reactions { list-style: none; padding: 0; margin: var(--space-3) 0 0; display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.post-reaction {
+  background: var(--letter); border: 1px solid var(--letter-line); color: var(--letter-ink);
+  border-radius: var(--radius-pill); padding: 2px 14px; font-size: var(--fs-small);
+}
+.post-empty { margin-top: var(--space-3); }
+
+.action-bar {
+  display: flex; gap: var(--space-2); margin-top: var(--space-3);
+  padding-top: var(--space-2); border-top: 1px solid var(--letter-line);
+}
+.act-btn {
+  flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: var(--btn-h-sub); padding: 4px 6px;
+  background: transparent; border-color: transparent; color: var(--letter-ink);
+  font-weight: 700; letter-spacing: 0; white-space: nowrap;
+}
+.act-btn:hover { border-color: var(--letter-line); background: var(--surface); }
+.act-btn.open { background: var(--surface); border-color: var(--letter-line); }
+.act-btn.on-soft { color: var(--primary); }
+.act-btn.like.on { color: var(--primary); }
+.act-icon { width: 24px; height: 24px; flex: none; }
+
+.header-bar .user-switch .diary-bell {
+  position: relative; width: 44px; min-height: 44px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: var(--text);
+}
+.diary-bell svg { width: 26px; height: 26px; }
+.diary-bell-count {
+  position: absolute; top: -4px; right: -6px;
+  min-width: 24px; height: 24px; padding: 0 6px; border-radius: var(--radius-pill);
+  background: var(--danger); color: #fff; font-size: 14px; font-weight: 700; line-height: 24px;
+  text-align: center; border: 2px solid var(--bg);
+}
+
+/* ベルを足した分、幅の狭い端末（〜374px）では見出しを少し詰めて表示名を切らさない */
+@media (max-width: 374px) {
+  .header-bar h1 { font-size: 18px; letter-spacing: 0; }
+  .header-bar .user-switch button { padding: 4px 6px; }
+  .header-bar { gap: var(--space-2); }
+  .header-bar h1 { min-width: 0; flex-shrink: 1; }
+}
