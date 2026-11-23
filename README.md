@@ -204,7 +204,7 @@ npm run build      # 本番ビルド（型チェック込み）
 ## AI（Gemini / モック）
 
 - 環境変数 `GEMINI_API_KEY` が設定されていれば Gemini API（既定モデル
-  `gemini-3.8-flash`、`GEMINI_MODEL` で変更可）で「今日の一言」を生成します。
+  `gemini-3.5-flash-lite`、`GEMINI_MODEL` で変更可）で「今日の一言」を生成します。
   API キーは URL ではなく `x-goog-api-key` ヘッダーで送ります。
 - 音声がある場合は `inline_data` で Gemini に渡し、**文字起こしと一言の生成を1回の呼び出し**で行います。
   文字起こしは記録の `transcript` に保存されます。音声形式を受け付けられなかった場合、
@@ -229,11 +229,13 @@ npm run build      # 本番ビルド（型チェック込み）
   - 直近7日のうち、感謝欄が空の日が2日以上
   - 「眠い」「だるい」「疲れ」などのことばが2日以上続けて出てくる（はじめの7日間に2日以上出ていた語は除外）
 
-> **提出前の確認事項（M-4）**：既定モデルは `gemini-3.8-flash` です。以前の既定 `gemini-2.0-flash` は、
-> 2026-11-22 の実キーでの確認で生成 API が 404（"no longer available"）を返したため変更しました
-> （`gemini-2.5-flash` も新規利用不可）。`gemini-3.8-flash` は同日、503（high demand）が継続しており、
-> **生成の成功はまだ確認できていません**。提出前に実キーで生成が通ることを確認してください。
-> 使えない場合は `GEMINI_MODEL` で利用可能なモデルを指定します。使えないモデルのままだと毎回モックに
+> **提出前の確認事項（M-4）**：既定モデルは `gemini-3.5-flash-lite` です。以前の既定 `gemini-2.0-flash` は、
+> 2026-11-22 の実キーでの確認で生成 API が 404（"no longer available"）を返したため `gemini-3.8-flash` に
+> 変更しました（`gemini-2.5-flash` も新規利用不可）。その `gemini-3.8-flash` は Google 側の容量不足で
+> 503（high demand）が継続した（11-22〜23 で計12回すべて 503）ため、2026-11-23 の実プローブで
+> テキスト生成・音声文字起こしとも 200 を確認した `gemini-3.5-flash-lite` を既定にしました。
+> API 単体の疎通は確認済みですが、**アプリ経由（実キー）での生成はまだ確認できていません**。
+> 提出前に実キーでアプリから生成が通ることを確認してください。使えない場合は `GEMINI_MODEL` で利用可能なモデルを指定します。使えないモデルのままだと毎回モックに
 > フォールバックし、「仕組みを見る」に「Gemini API の呼び出しでエラー」と表示されます。
 > また Chrome の録音形式 `audio/webm` は Gemini の音声対応形式の一覧に明記されていないため、
 > 実キーで音声の文字起こしが通るかを一度確認してください（失敗時は上記のとおり文字だけで再試行）。
@@ -285,7 +287,7 @@ GitHub の Settings → Secrets and variables → Actions → **Variables** に�
 | `UPLOADS_BUCKET` | 写真・音声のバケット名（`GCS_UPLOAD_BUCKET` に入る） | ○ |
 | `FRONTEND_BUCKET` | フロントの静的配信バケット名 | ○ |
 | `GEMINI_API_KEY_SECRET` | Gemini API キーを入れたシークレット名 | 任意 |
-| `GEMINI_MODEL` | モデル名（未設定なら既定の `gemini-3.8-flash`） | 任意 |
+| `GEMINI_MODEL` | モデル名（未設定なら既定の `gemini-3.5-flash-lite`） | 任意 |
 | `SEED_JOB_NAME` | seed 用 Cloud Run Job の名前（未設定なら `kagami-seed-demo`） | 任意 |
 
 必須の Variables が欠けていると、デプロイジョブは最初のステップで名前を挙げて失敗します。
@@ -393,3 +395,52 @@ app/
         ├── api.ts        # API クライアントと型（画面は API をここ経由でだけ呼ぶ）
         └── styles.css
 ```
+
+## 開発フロー
+
+Issue ドリブンで開発します（2026-11-23〜）。Claude Code の運用ルールの詳細は `AGENTS.md`（`CLAUDE.md` はそのシンボリックリンク）の「開発フロー」節にあります。
+
+### MCP のセットアップ
+
+リポジトリ直下の `.mcp.json` に、Claude Code が使う MCP サーバーの接続先だけを定義しています。**認証情報は含みません**（各自の環境で認証します）。
+
+| サーバー | 接続先 | 認証 |
+|---|---|---|
+| `github` | GitHub 公式リモート MCP（`https://api.githubcopilot.com/mcp/`） | 環境変数 `GITHUB_PERSONAL_ACCESS_TOKEN` の Fine-grained PAT（`Authorization: Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}` として送る） |
+| `notion` | Notion 公式 MCP（`https://mcp.notion.com/mcp`） | OAuth（Claude Code の `/mcp` から各自が認可） |
+
+1. Fine-grained PAT を用意する（権限は Contents / Issues / Pull requests の Read and write のみ。**Workflows 権限は付けない**）
+2. Claude Code を起動するシェルで環境変数 `GITHUB_PERSONAL_ACCESS_TOKEN` に設定する。トークンの値をリポジトリ・`.mcp.json`・ドキュメント・ログに書かない
+3. このリポジトリで Claude Code を開き、`.mcp.json` のサーバーを承認する。Notion は `/mcp` から OAuth で認可する
+
+`gh` CLI（Issue・PR の操作に使う）も同じ PAT で認証します（`gh auth login`）。設定の共有は権限の付与ではありません。Claude が何をできるかは、各環境の PAT・OAuth の範囲で決まります。
+
+### Issue ドリブンの流れ
+
+1. **条件提示**：Deroshi（PM）が、何を・なぜ・どこまでを決める
+2. **起票**：Claude が Issue を起票する。必須項目は **背景 / スコープ / 受け入れ条件 / 対象外**。大きな Issue は実装前に Deroshi が確認する（小さいタスクのバッチは起票→実装を通してよい）
+3. **ブランチ**：main から Issue ごとにブランチを切る（1 Issue = 1 ブランチ = 1 PR）
+4. **PR**：Claude が検品（テスト・ビルド・画面確認）してから PR を作る。本文に `Closes #<番号>` とテスト・ビルド結果を書く
+5. **レビュー・マージ**：Deroshi がレビューしてマージする（Claude はマージしない）。main へのマージで CI/CD（上の「CI/CD」節）がデプロイする
+
+- **main への直接 push は禁止**。必ず PR を経由する
+- GCP の手動操作はしない（デプロイは CI 経由）。`.github/workflows` は変更しない（ワークフローの変更はオーナーの手だけ）
+
+### ブランチ命名
+
+`<リポジトリ名（小文字）>-i<番号>-<タイトルを英訳したスラッグ>`
+
+- 例：`kyou-no-kagami-i12-enlarge-record-buttons`（Issue #12「記録画面のボタンを大きくする」）
+- リポジトリ名を付けるのは、インフラリポジトリ（`kyou-no-kagami-infra-i3-...`）と行き来するときに一目で分かるようにするため
+
+### スキル（`.claude/skills/`）
+
+| スキル | 用途 |
+|---|---|
+| `file-issue` | 条件 → テンプレどおりに Issue を起票（`gh issue create`） |
+| `start-issue` | Issue 番号 → 命名規則どおりのブランチを main から作成 |
+| `open-pr` | 検品 → commit → push → PR 作成（`Closes #<番号>`・テスト結果つき）。マージはしない |
+| `verify-app` | バックエンドテスト（SQLite）＋フロントビルド＋Playwright（Python）の画面確認＋仕様の不変条件の照合 |
+| `code-review` | PR 番号 → 差分・Issue の受け入れ条件・不変条件・CI を照合した構造化レビュー。マージ判断は Deroshi |
+
+スキル本体はリポジトリに依存しない書き方にしてあり、リポジトリ名・テストコマンドなどの値は `AGENTS.md` の「スキルが参照する値」表から読みます。

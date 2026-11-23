@@ -139,7 +139,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | 変数 | 用途 |
 |---|---|
 | `GEMINI_API_KEY` | 設定すると Gemini を使う。未設定ならモック。キーは `x-goog-api-key` ヘッダーで送り、エラー文では伏せ字にする |
-| `GEMINI_MODEL` | モデル名。既定は `gemini-3.8-flash` |
+| `GEMINI_MODEL` | モデル名。既定は `gemini-3.5-flash-lite` |
 | `APP_DB_PATH` / `APP_UPLOAD_DIR` | SQLite とアップロードの置き場所 |
 | `DB_BACKEND` | `mysql` で MySQL（Cloud SQL）、それ以外・未設定は SQLite |
 | `MYSQL_HOST` / `MYSQL_PORT` | `/` で始まれば Unix ソケット（Cloud Run は `/cloudsql/<PROJECT>:<REGION>:<INSTANCE>`）、それ以外は TCP（ポート既定 3306） |
@@ -150,7 +150,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 
 ### 既知の未確認事項
 
-- **実キーでの生成成功は未確認**。旧既定の `gemini-2.0-flash` は 2026-11-22 の実地確認で生成 API が 404（"no longer available"）を返した（`gemini-2.5-flash` も新規利用不可）ため、既定を `gemini-3.8-flash` に変更した。`gemini-3.8-flash` は存在するが、同日は 503（high demand）が継続し、生成の成功確認は未了。提出前に確かめる。使えなければ毎回モックに落ち、「仕組みを見る」に Gemini エラーと出る
+- **アプリ経由での実キー生成は未確認**。旧既定の `gemini-2.0-flash` は 2026-11-22 の実地確認で生成 API が 404（"no longer available"）を返した（`gemini-2.5-flash` も新規利用不可）ため、既定を `gemini-3.8-flash` に変更した。しかし `gemini-3.8-flash` は Google 側の容量不足で 503（high demand）が継続した（11-22〜23 で計12回すべて 503）ため、2026-11-23 に実プローブで生成・文字起こしとも 200 を確認した `gemini-3.5-flash-lite` を既定にした（API 単体の疎通のみ確認。詳細はワークスペースの `gemini-503-research-2026-11-23.md`）。Lite 系でも 503 が間欠的に出ることがある（再試行で回復）。提出前にアプリ経由で確かめる。使えなければ毎回モックに落ち、「仕組みを見る」に Gemini エラーと出る
 - **MySQL 版 Store は実機未検証**（2026-11-22 時点。この環境に MySQL / Docker が無かった）。オフライン検査（メソッド一致・プレースホルダ数・接続設定）だけ通っている。提出前に `docker compose --profile mysql` か Cloud SQL で `tests.test_mysql_store` の実機検査を通す
 - **Chrome の録音形式 `audio/webm` を Gemini が文字起こしできるかは未確認**（公式の対応形式一覧に載っていない）。断られたときは、文字の入力があれば文字だけで再試行する
 - **Cloud Storage 版のアップロード保存先は実機未検証**（2026-11-22 時点）。フェイクの Client で保存・配信・削除・解析時の読み込みの分岐だけを `tests/test_uploads.py` で検証している。提出前に実バケットと Cloud Run のサービスアカウントで、保存→`/uploads` での表示・再生（Safari の `<audio>` の Range を含む）→上書き時の削除を確かめる
@@ -191,3 +191,46 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 ### 報告
 
 日本語で。実行したコマンドと結果、置いた仮定、確認が必要な事項を明記する。実キーでの確認やテストができなかった場合はその理由も書く。未実施の手順を実施済みと書かない。
+
+## 開発フロー
+
+2026-11-23 から Issue ドリブンで進める。Deroshi（PM）が条件を決め、Claude が Issue 起票 → ブランチで実装 → PR 作成、Deroshi がレビューしてマージし、デプロイは CI/CD が行う。セッションは 1 Issue = 1 セッションを基本にし、引き継ぎは会話ではなく Issue・PR・このファイル・レポートで行う。
+
+### 運用ルール
+
+- Issue は Deroshi の条件提示を受けて Claude が起票する。テンプレ必須項目：**背景 / スコープ / 受け入れ条件 / 対象外**
+- 大きな Issue（上の「人間確認が必要なとき」に当たるもの、3 ファイル以上にまたがるもの）は、実装前に Deroshi が内容を確認する。小さいタスクのバッチは起票→実装を通してよい
+- ブランチ命名：`<リポジトリ名（小文字）>-i<番号>-<タイトルを英訳したスラッグ>`（例：`kyou-no-kagami-i12-enlarge-record-buttons`）。main から切る。1 Issue = 1 ブランチ = 1 PR
+- **main への直接 push 禁止。必ず PR を作る**
+- PR 本文に `Closes #<番号>` とテスト・ビルド結果を書く。**マージは Deroshi**（レビュー通過後）。Claude はマージしない
+- push と PR 作成は、Deroshi に依頼されたときに `open-pr` の手順で行う（上の「明示依頼なしでは実行しない」は変わらない）
+- GCP の手動操作はしない。デプロイは CI 経由（main へのマージで `.github/workflows/ci-cd.yml` が動く）。Terraform apply は従来どおり plan → オーナーの OK → apply のゲートを維持する（インフラリポジトリ側）
+- **`.github/workflows` は変更しない**（PAT に Workflows 権限は付けていない。ワークフローの変更はオーナーの手だけ）
+
+### スキル（`.claude/skills/`）
+
+| スキル | 用途 |
+|---|---|
+| `file-issue` | 条件 → テンプレどおりに Issue を起票 |
+| `start-issue` | Issue 番号 → 命名規則どおりのブランチを main から作成 |
+| `open-pr` | 検品 → commit → push → PR 作成（`Closes #<番号>`・テスト結果つき）。マージはしない |
+| `verify-app` | バックエンドテスト＋フロントビルド＋Playwright（Python）の画面確認＋不変条件の照合 |
+| `code-review` | PR 番号 → 差分・Issue・CI を照合した構造化レビュー。マージ判断は Deroshi |
+
+スキル本体は汎用に書いてあり、リポジトリ固有の値は下の表から読む。値が変わったら表だけを直す。
+
+### スキルが参照する値
+
+| キー | 値 |
+|---|---|
+| リポジトリ | `TMiyazaki16/kyou-no-kagami` |
+| ブランチ接頭辞 | `kyou-no-kagami` |
+| 既定ブランチ | `main` |
+| gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
+| 検証スキル | `verify-app` |
+| テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
+| テストの期待値 | `Ran 68 tests` / `OK (skipped=1)`（2026-11-23 時点。skip は MySQL 実機検査）。テストを足したら更新する |
+| ビルド | `cd frontend && npm run build` |
+| 画面確認用 Python | `playwright` が入った Python（アプリの依存ではない。無ければ `verify-app` の 3-1 で別 venv を作る） |
+| 不変条件 | このファイルの「仕様の不変条件」 |
+| 変更禁止パス | `.github/workflows/` |

@@ -33,7 +33,7 @@ import urllib.request
 from . import rules
 
 BASELINE_DAYS = rules.BASELINE_DAYS
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # The only health-related wording the AI may ever produce (fixed phrase).
 FIXED_CARE_PHRASE = "気になることが続くときは、かかりつけの先生にも相談してみてくださいね。"

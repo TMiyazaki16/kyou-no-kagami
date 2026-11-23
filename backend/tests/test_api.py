@@ -127,7 +127,7 @@ class TestRecordFlow(Base):
         dev = self.c.get("/api/dev/latest-analysis").json()
         self.assertEqual(dev["analysis"]["fallback_reason"], "no_api_key")
         self.assertFalse(dev["gemini_configured"])
-        self.assertEqual(dev["gemini_model"], "gemini-3.8-flash")
+        self.assertEqual(dev["gemini_model"], "gemini-3.5-flash-lite")
 
     def test_empty_record_rejected(self):
         self.assertEqual(self.post_record().status_code, 400)
