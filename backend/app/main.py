@@ -47,6 +47,7 @@ PLACEHOLDER_DRAFT = "（AI下書きはまだありません。記録すると、
 PHOTO_MIMES = uploads.PHOTO_MIMES
 AUDIO_MIMES = uploads.AUDIO_MIMES
 EXT_TO_AUDIO_MIME = {ext: mime for mime, ext in AUDIO_MIMES.items()}
+EXT_TO_PHOTO_MIME = {ext: mime for mime, ext in PHOTO_MIMES.items()}
 MAX_BYTES = {"photo": 10 * 1024 * 1024, "audio": 5 * 1024 * 1024}
 
 
@@ -356,20 +357,24 @@ def get_record(record_id: int, user_id: str = Depends(_uid)):
 # Analysis (M2)
 # --------------------------------------------------------------------------
 
+def _load_media(path: str | None, ext_to_mime: dict[str, str]) -> tuple[bytes, str] | None:
+    """記録の音声・写真の中身と MIME（拡張子から決める）。無い・読めないときは None。"""
+    mime = ext_to_mime.get(os.path.splitext(path)[1].lower()) if path else None
+    if not mime:
+        return None
+    data = upload_storage.read(path)
+    return (data, mime) if data is not None else None
+
+
 def run_analysis(rec: dict) -> dict:
     """記録1件を解析して保存する（API と scripts/seed_demo.py の共通処理）。"""
     user_id = rec["user_id"]
     baseline_day = store.distinct_record_days(user_id, rec["date"])
     previous = store.previous_record(user_id, rec["id"])
     history = [r for r in store.list_records(user_id) if r["date"] <= rec["date"]]
-    audio = None
-    path = rec.get("audio_path")
-    mime = EXT_TO_AUDIO_MIME.get(os.path.splitext(path)[1].lower()) if path else None
-    if mime:
-        data = upload_storage.read(path)
-        if data is not None:
-            audio = (data, mime)
-    result = analysis_mod.analyze(rec, baseline_day, previous, history, audio)
+    audio = _load_media(rec.get("audio_path"), EXT_TO_AUDIO_MIME)
+    photo = _load_media(rec.get("photo_path"), EXT_TO_PHOTO_MIME)
+    result = analysis_mod.analyze(rec, baseline_day, previous, history, audio, photo)
     if result.get("transcript") and not (rec.get("transcript") or "").strip():
         store.update_record(rec["id"], {"transcript": result["transcript"]})
     return store.save_analysis({

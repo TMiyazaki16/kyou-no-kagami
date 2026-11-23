@@ -264,16 +264,19 @@ class TestRecordsWithGCS(Base):
     def test_analysis_reads_audio_from_bucket(self):
         captured = {}
 
-        def fake_analyze(rec, baseline_day, previous, history, audio):
-            captured["audio"] = audio
+        def fake_analyze(rec, baseline_day, previous, history, audio, photo=None):
+            captured["audio"], captured["photo"] = audio, photo
             return {"todays_word": None, "observations": [], "engine": "mock", "request": {},
                     "response": {}, "kind": "voice_notice", "notice": "n", "fallback_reason": "no_api_key"}
 
         audio_bytes = b"\x1aE\xdf\xa3" + b"1" * 20
-        rec = self.post(files={"audio": ("a.webm", audio_bytes, "audio/webm")}).json()
+        rec = self.post(files={"audio": ("a.webm", audio_bytes, "audio/webm"),
+                               "photo": ("a.png", PNG, "image/png")}).json()
         with mock.patch.object(main.analysis_mod, "analyze", fake_analyze):
             self.assertEqual(self.c.post(f"/api/records/{rec['id']}/analyze").status_code, 200)
         self.assertEqual(captured["audio"], (audio_bytes, "audio/webm"))
+        # 写真も同じくバケットから読んで解析に渡す（#11）
+        self.assertEqual(captured["photo"], (PNG, "image/png"))
 
 
 if __name__ == "__main__":

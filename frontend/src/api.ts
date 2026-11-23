@@ -46,7 +46,7 @@ export interface Analysis {
   todays_word: string | null;
   kind: WordKind;
   notice: string;
-  /** "" | "no_api_key" | "gemini_error" | "guard_ng_word" | "guard_no_quote" | "guard_baseline_change" | "guard_assertive" */
+  /** "" | "no_api_key" | "gemini_error" | "guard_ng_word" | "guard_appearance" | "guard_no_quote" | "guard_baseline_change" | "guard_assertive" */
   fallback_reason: string;
   observations: string[];
   engine: string;
