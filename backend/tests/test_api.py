@@ -725,6 +725,94 @@ class TestGeminiFallback(Base):
 
 
 # --------------------------------------------------------------------------
+class TestMirrorWord(unittest.TestCase):
+    """モックの今日の一言：日記の要約ではなく、本人の言葉を映し返す（#7）。API を通さない単体検査。"""
+
+    SAMPLES = [
+        ("今日も天気がいい！", "そこそこ元気！"),
+        ("孫から電話があった", "元気だけど眠い"),
+        ("", "元気だけど眠い"),
+        ("", "眠い。元気"),
+        ("温かいお茶", "なんだか疲れた"),
+        ("", "なんだか疲れた、気分が重い"),
+        ("庭のバラが咲いた", "ふつう"),
+        ("", "ふつう"),
+        ("", "楽しかった"),
+        ("庭のバラが咲いた", ""),
+        ("病院の帰りに見た桜", "薬を飲んで少し楽"),  # 本人の言葉に NG 語があっても、引用の外には出ない
+    ]
+
+    def _word(self, g: str, m: str, d: str, spoken: str = "") -> str:
+        r = analysis._analyze_mock(
+            {"user_id": "mother", "date": d, "gratitude": g, "mood": m, "transcript": spoken}, 3, None)
+        self.assertEqual(r["kind"], "word")
+        return r["todays_word"]
+
+    def test_all_variants_quote_and_pass_guards(self):
+        # 連続した3日で、締めの文のすべての版を通す
+        for g, m in self.SAMPLES:
+            for d in ("2026-11-21", "2026-11-22", "2026-11-23"):
+                with self.subTest(g=g, m=m, d=d):
+                    w = self._word(g, m, d)
+                    answers = [t for t in (g, m) if t]
+                    self.assertTrue(analysis.has_quote(answers, w), w)
+                    own = analysis.strip_user_quotes(w, answers)
+                    self.assertEqual(analysis.find_ng_words(own), [], w)
+                    # ベースライン中にも出すので、変化・比較の語を地の文に含めない
+                    self.assertEqual([x for x in analysis.BASELINE_CHANGE_WORDS if x in own], [], w)
+                    self.assertNotIn("昨日", own)
+                    self.assertNotIn(analysis.FIXED_CARE_PHRASE, w)
+                    # 要約の定型（旧テンプレート）に戻っていない
+                    self.assertNotIn("今日のあなたの記録です", w)
+                    self.assertNotIn("と教えてくれました", w)
+
+    def test_spoken_only_quotes_transcript(self):
+        w = self._word("", "", "2026-11-23", spoken="孫から手紙が届いた")
+        self.assertIn("「孫から手紙が届いた」", w)
+
+    def test_coexisting_feelings_are_mirrored(self):
+        for m in ("元気だけど眠い", "元気。でも眠い", "眠い。元気"):
+            with self.subTest(m=m):
+                w = self._word("", m, "2026-11-23")
+                self.assertIn("「元気」", w)
+                self.assertIn("「眠い」", w)
+                self.assertIn("同居", w)
+        self.assertNotIn("同居", self._word("", "元気がない", "2026-11-23"))
+
+    def test_low_mood_is_not_relabelled_as_positive(self):
+        w = self._word("温かいお茶", "なんだか疲れた", "2026-11-23")
+        self.assertIn("「なんだか疲れた」", w)
+        self.assertIn("「温かいお茶」", w)
+        self.assertNotIn("明るい", w)
+
+    def test_hedge_word_is_noticed(self):
+        w = self._word("今日も天気がいい！", "そこそこ元気！", "2026-11-23")
+        self.assertIn("「そこそこ」という言い方", w)
+
+    def test_consecutive_days_vary(self):
+        words = {self._word("庭のバラが咲いた", "ふつう", f"2026-11-{d}") for d in (21, 22, 23)}
+        self.assertEqual(len(words), 3)
+
+    def test_no_gratitude_placeholder_is_not_quoted(self):
+        w = self._word("特になし", "なんだか疲れた", "2026-11-23")
+        self.assertNotIn("「特になし」", w)
+        self.assertIn("「なんだか疲れた」", w)
+
+    def test_gemini_prompt_keeps_format_and_prohibitions(self):
+        req = {"inputs": {"gratitude": "庭のバラ", "mood": "元気だけど眠い"},
+               "baseline_day": 3, "baseline_period": True}
+        p = analysis._gemini_prompt(req, with_audio=False)
+        for key in ('"transcript"', '"todays_word"', '"observations"'):
+            self.assertIn(key, p)
+        self.assertIn("判断・診断", p)
+        self.assertIn("病名や医療的な助言", p)
+        self.assertIn("変化への言及はしないでください", p)
+        self.assertIn("「」で具体的にそのまま引用", p)
+        # 鏡としての返し方の指示（今回足した部分）には NG 語を含めない
+        guidance = analysis.SYSTEM_RULES.split("『今日の一言』は日記の要約ではありません", 1)[1]
+        self.assertEqual(analysis.find_ng_words(guidance), [])
+
+
 class TestChangeRulesAndSeed(Base):
     def test_rules_silent_during_baseline(self):
         res = self.seed_days("mother", [("", "眠い")] * 7)
