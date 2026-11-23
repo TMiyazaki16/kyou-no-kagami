@@ -18,6 +18,7 @@ description: アプリの検品。バックエンドのテスト（SQLite）、�
 
 ```sh
 cd backend
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # .venv が無いときだけ。requirements.txt どおりに入れる（依存は増やさない）
 env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v
 ```
 
