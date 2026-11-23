@@ -11,6 +11,8 @@ export function ShareConfirm({ family, go }: Ctx) {
   const [share, setShare] = useState<Share | null>(null);
   const [toUser, setToUser] = useState<string>(family.length === 1 ? family[0].id : "");
   const [text, setText] = useState("");
+  // 「写真も一緒に届ける」。既定はオフ（記録に写真があっても、本人がオンにしたときだけ届く）
+  const [includePhoto, setIncludePhoto] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -35,6 +37,7 @@ export function ShareConfirm({ family, go }: Ctx) {
       const s = await api.createDraft(toUser || undefined);
       setShare(s);
       setText(s.final_text.startsWith(PLACEHOLDER_PREFIX) ? "" : s.final_text);
+      setIncludePhoto(false);
       setStatus("");
     });
 
@@ -48,10 +51,10 @@ export function ShareConfirm({ family, go }: Ctx) {
   const send = () =>
     wrap(async () => {
       if (!share) return;
-      const s = await api.sendShare(share.id, text);
+      const s = await api.sendShare(share.id, text, includePhoto && !!share.record_photo_url);
       setShare(s);
       setText(s.final_text);
-      setStatus(`✓ ${s.to_name}へ届けました`);
+      setStatus(s.photo_url ? `✓ ${s.to_name}へ、写真と一緒に届けました` : `✓ ${s.to_name}へ届けました`);
     });
 
   return (
@@ -95,6 +98,27 @@ export function ShareConfirm({ family, go }: Ctx) {
             placeholder="家族に届けたいことを、ひとこと書いてください"
             onChange={(e) => setText(e.target.value)}
           />
+          {!sent && share.record_photo_url && (
+            <div className="photo-toggle">
+              <label className="toggle-label">
+                <input
+                  type="checkbox"
+                  checked={includePhoto}
+                  onChange={(e) => setIncludePhoto(e.target.checked)}
+                />
+                <span>写真も一緒に届ける</span>
+              </label>
+              <p className="muted">
+                {includePhoto
+                  ? "この写真も便りと一緒に届きます。"
+                  : "記録の写真は届きません（文面だけが届きます）。"}
+              </p>
+              {includePhoto && <img className="preview share-photo" src={share.record_photo_url} alt="一緒に届ける写真" />}
+            </div>
+          )}
+          {sent && share.photo_url && (
+            <img className="preview share-photo" src={share.photo_url} alt="便りと一緒に届けた写真" />
+          )}
           {!sent && (
             <div className="row">
               <button onClick={saveEdit} disabled={busy}>下書きを保存</button>

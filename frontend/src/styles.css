@@ -364,3 +364,37 @@ body.sheet-open { overflow: hidden; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---- 届いた便り：写真・リアクション・返信（#13） -------------------- */
+.letter-photo {
+  display: block; width: 100%; max-height: 360px; object-fit: contain;
+  background: var(--surface); border: 1px solid var(--letter-line); border-radius: var(--radius-m);
+  margin: var(--space-3) 0 0;
+}
+.sent-card .letter-photo { border-color: var(--line); max-height: 240px; }
+.photo-caption { margin-top: var(--space-1); font-size: var(--fs-small); }
+.stamp-chip.like span { font-size: 20px; line-height: 1; }
+.reply-thread { list-style: none; padding: 0; margin: var(--space-3) 0 0; }
+.reply-item {
+  background: var(--surface); border: 1px solid var(--letter-line);
+  border-radius: 16px 16px 16px 4px; padding: var(--space-2) var(--space-4);
+}
+.sent-card .reply-item { background: var(--letter); }
+.reply-item + .reply-item { margin-top: var(--space-2); }
+.reply-meta { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.reply-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.letter-card .reply-label { margin-top: var(--space-4); }
+.reply-input { min-height: calc(1.7em * 2 + 24px); background: var(--surface); }
+.reply-actions {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-3);
+  margin-top: var(--space-2);
+}
+.reply-count { color: var(--muted); font-size: var(--fs-small); }
+.reply-count.over { color: var(--danger); font-weight: 700; }
+
+/* ---- 共有の確認：写真も一緒に届ける ------------------------------- */
+.photo-toggle { margin-top: var(--space-4); padding: var(--space-3) var(--space-4); border: 1px solid var(--line); border-radius: var(--radius-m); }
+.toggle-label { display: flex; align-items: center; gap: var(--space-3); font-weight: 700; cursor: pointer; min-height: var(--btn-h-sub); }
+.toggle-label input[type="checkbox"] { width: 26px; height: 26px; min-height: 0; margin: 0; flex: none; accent-color: var(--primary); }
+.photo-toggle .muted { margin: var(--space-1) 0 0; }
+.share-photo { max-height: 240px; object-fit: contain; }

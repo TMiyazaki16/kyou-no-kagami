@@ -37,7 +37,7 @@ backend/
   app/analysis.py     日次解析。Gemini / モックの切替と、Gemini 出力の後段ガード
   app/rules.py        変化への気づきルール（観察文を返す）
   scripts/seed_demo.py  デモデータ投入
-  tests/test_api.py   TestClient による検証（unittest）
+  tests/test_api.py   TestClient による検証（unittest）。便りのリアクション・返信・写真は TestLetterReactions
   tests/test_mysql_store.py  MySQLStore の検証（オフライン検査は常時、実機検査は KAGAMI_TEST_MYSQL=1 のときだけ）
   tests/test_uploads.py  保存先の切替の検証（GCS はフェイクの Client。実機は使わない）
 frontend/src/
@@ -59,6 +59,8 @@ frontend/src/
 - 他人の記録の参照・解析・共有は 403、他人の下書きの編集・送信は 403、送信済みの変更は 409
 - 家族コードは `XXXX-XXXX-XXXX`（紛らわしい文字を除く31文字×12桁）。相手のコードを入れると双方向に連携する（コードを伝えること＝同意とみなす）。解除はどちらからでもでき、解除後は作りかけの下書きも送れず、スタンプも返せない（届いた便りは残る）
 - **連携しても記録は届かない**：連携は「便りを送れる相手」を決めるだけ。連携相手の記録・一言・観察・週のカウントを見せる API や画面を作らない（不変条件「共有は本人が送るまで発生しない」「記録日数を比べない」を守るため）
+- 届いた便りへのリアクション（`STAMPS`＝「いいね」＋旧スタンプ。保存は `stamps` 表、`toggle_stamp` で人×種類ごとに1つ）と返信（`letter_replies` 表、200字まで）は、受け取った連携中の相手だけ。既読表示は作らない
+- 便りの写真は既定で届けない。送信時に `include_photo: true` のときだけ、記録の写真の参照を `shares.photo_path` に写し取る（応答は `photo_url` だけ。記録の上書き時、便りが参照する写真は消さない）
 - 下書きの宛先：連携相手が1人なら自動、複数なら `to_user` で選ぶ。未連携の相手は 403、誰とも連携していなければ 400
 - 表示名は本人が決める（デモは「母さん」のように敬称込み）。画面では表示名に「さん」を自動で付けない
 - **パスワード・トークンをログ・レスポンス・ファイルに出さない**（`Store` の利用者向けメソッドは `password_hash` を返さない。照合は `get_password_hash` だけ）
@@ -75,7 +77,7 @@ frontend/src/
 - 起動時（`main.py` の import 時）に `auth.migrate_legacy_users` が、`mother` / `daughter` のデータがあってアカウントがないときだけデモアカウントを作り、連携する。旧データのない新しいDBでは何もしない
 - `seed_demo.py` は `auth.ensure_demo_accounts` で2アカウントを作って連携してから投入する
 
-- `storage.py` — 永続化はすべて `Store` を経由する。実装の選択は `storage.create_store()`（`DB_BACKEND=mysql` → `MySQLStore`、それ以外 → `SQLiteStore`）。Store にメソッドを足すときは `SQLiteStore` と `MySQLStore` の両方に実装する（`test_mysql_store` がメソッドの一致を検査する）。`main.py` から SQL を直接書かない。アカウント・セッション・家族連携も `Store` のメソッド（`create_user` / `create_session` / `add_family_link` など）を通す。記録は1ユーザー1日1件で、同じ日の2回目は `upsert_record` で上書きする。既存DBに足りない列は起動時に `ALTER TABLE` で追加する（`_ANALYSIS_EXTRA_COLUMNS`。MySQL は `storage_mysql._MYSQL_ANALYSIS_EXTRA_COLUMNS` にも足す）
+- `storage.py` — 永続化はすべて `Store` を経由する。実装の選択は `storage.create_store()`（`DB_BACKEND=mysql` → `MySQLStore`、それ以外 → `SQLiteStore`）。Store にメソッドを足すときは `SQLiteStore` と `MySQLStore` の両方に実装する（`test_mysql_store` がメソッドの一致を検査する）。`main.py` から SQL を直接書かない。アカウント・セッション・家族連携も `Store` のメソッド（`create_user` / `create_session` / `add_family_link` など）を通す。記録は1ユーザー1日1件で、同じ日の2回目は `upsert_record` で上書きする。既存DBに足りない列は起動時に `ALTER TABLE` で追加する（analyses は `_ANALYSIS_EXTRA_COLUMNS`、shares は `_SHARE_EXTRA_COLUMNS`。MySQL は `storage_mysql._MYSQL_ANALYSIS_EXTRA_COLUMNS` / `_MYSQL_SHARE_EXTRA_COLUMNS` にも足す）
 - `storage_mysql.py` — MySQL の方言：プレースホルダは `%s`（SQL にリテラルの `%` を書かない）、`BIGINT AUTO_INCREMENT`、索引・一意の列は VARCHAR、TEXT にリテラル DEFAULT を付けない（値はアプリが渡す）、`utf8mb4` / `utf8mb4_bin`（SQLite と同じバイナリ照合）。日時は DATETIME にせずタイムゾーン付き ISO 文字列（`main._parse_ts` が前提にしている）。記録は `(user_id, date)` に UNIQUE を付けて `INSERT ... ON DUPLICATE KEY UPDATE` で upsert。重複判定は INSERT IGNORE ではなくエラー 1062 を捕まえる。スキーマは `CREATE TABLE IF NOT EXISTS` で冪等。接続情報（特にパスワード）をログ・例外メッセージ・repr に出さない
 - `uploads.py` — アップロードの読み書き・削除・配信はすべて `main.upload_storage`（`uploads.create_upload_storage()`）を通す。`main.py` で `open()` や GCS を直接触らない。`UPLOAD_BACKEND=gcs` → `GCSUploadStorage`（バケット `GCS_UPLOAD_BUCKET` 直下、記録の参照は `gs://<bucket>/<uuid>.<ext>`）、それ以外 → `LocalUploadStorage`（`APP_UPLOAD_DIR`、参照は絶対パス）。公開URLはどちらも `/uploads/<basename>`（`uploads.public_url`）で、API にバケット名・`gs://`・実パスを出さない。配信はローカルが StaticFiles、GCS はバックエンドが読んで返すプロキシ（署名付き URL にしない＝認証なし・uuid 名という既存の性質を保つ）。GCS 配信は uuid 形式の名前だけ受け付け、Content-Type は拡張子から決める。`google-cloud-storage` は GCS 選択時だけ import（ローカルでは未インストールでも動く）。認証は ADC（Cloud Run のサービスアカウント、権限はバケットに `roles/storage.objectAdmin` 相当）で、鍵ファイルは使わない・リポジトリに置かない
 - `analysis.py` — `GEMINI_API_KEY` があれば Gemini、なければ決定的なモック。呼び出しは主モデル → 代替モデル（`GEMINI_FALLBACK_MODEL`）→ モックの順で、一次的エラー（503・429・5xx・タイムアウト）だけ各モデル最大2回まで指数バックオフ（1s→2s）で再試行する（待ちは `analysis._sleep` を通すので、テストは差し替えて実時間で眠らない）。全滅したらモックに落とし、理由を `fallback_reason`（`no_api_key` / `gemini_error` / `guard_*`）に残す。「仕組みを見る」画面がこれを表示する。Gemini の出力はそのまま使わず、`_apply_guards` で検査する：NG語、引用チェック、ベースライン中の変化への言及（引用部分を除いて検査）、ベースライン中の観察文差し替え、定型文の付与、疲れ・体調の断定調（`guard_assertive`）、外見へのコメント（`guard_appearance`、写真の有無によらず）。写真があれば音声と同じく `inline_data` で渡し（各試行とも）、写真を受け付けない恒常的エラーでは写真だけ外して続行する。モックは写真の中身に触れず「写真が届いた」とだけ書く。ガードを緩める変更は、審査で「AIは診断しない」を説明できなくなるので相談する
@@ -231,7 +233,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
 | 検証スキル | `verify-app` |
 | テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
-| テストの期待値 | `Ran 109 tests` / `OK (skipped=1)`（2026-11-23 時点。skip は MySQL 実機検査）。テストを足したら更新する |
+| テストの期待値 | `Ran 119 tests` / `OK (skipped=1)`（2026-11-23 時点。skip は MySQL 実機検査）。テストを足したら更新する |
 | ビルド | `cd frontend && npm run build` |
 | 画面確認用 Python | `playwright` が入った Python（アプリの依存ではない。無ければ `verify-app` の 3-1 で別 venv を作る） |
 | 不変条件 | このファイルの「仕様の不変条件」 |

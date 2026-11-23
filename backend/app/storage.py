@@ -86,6 +86,13 @@ class Store:
     def list_letters_sent_by(self, user_id: str) -> list[dict]: raise NotImplementedError
     def add_stamp(self, share_id: int, from_user: str, stamp: str) -> dict: raise NotImplementedError
     def list_stamps(self, share_id: int) -> list[dict]: raise NotImplementedError
+    def toggle_stamp(self, share_id: int, from_user: str, stamp: str) -> bool:
+        """リアクション（stamps 表）の付け外し。付けたら True、外したら False。同じ人・同じ種類は1つまで。"""
+        raise NotImplementedError
+
+    # letter replies（届いた便りへのテキスト返信）
+    def add_reply(self, share_id: int, from_user: str, body: str) -> dict: raise NotImplementedError
+    def list_replies(self, share_id: int) -> list[dict]: raise NotImplementedError
 
 
 SCHEMA = """
@@ -131,7 +138,16 @@ CREATE TABLE IF NOT EXISTS stamps (
     stamp TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS letter_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id INTEGER NOT NULL,
+    from_user TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_records_user_date ON records (user_id, date);
+CREATE INDEX IF NOT EXISTS idx_stamps_share ON stamps (share_id);
+CREATE INDEX IF NOT EXISTS idx_letter_replies_share ON letter_replies (share_id);
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -162,6 +178,10 @@ _ANALYSIS_EXTRA_COLUMNS = {
     "notice": "TEXT NOT NULL DEFAULT ''",            # kind=voice_notice のときの案内文
     "fallback_reason": "TEXT NOT NULL DEFAULT ''",   # '' | no_api_key | gemini_error | guard_*
 }
+_SHARE_EXTRA_COLUMNS = {
+    # 送信時に本人が「写真も一緒に届ける」を選んだときだけ、記録の写真の参照を写し取る（既定は NULL＝届けない）
+    "photo_path": "TEXT",
+}
 
 
 class SQLiteStore(Store):
@@ -174,10 +194,11 @@ class SQLiteStore(Store):
         self._lock = threading.RLock()
         with self._conn() as c:
             c.executescript(SCHEMA)
-            cols = {r["name"] for r in c.execute("PRAGMA table_info(analyses)").fetchall()}
-            for name, ddl in _ANALYSIS_EXTRA_COLUMNS.items():
-                if name not in cols:
-                    c.execute(f"ALTER TABLE analyses ADD COLUMN {name} {ddl}")
+            for table, extra in (("analyses", _ANALYSIS_EXTRA_COLUMNS), ("shares", _SHARE_EXTRA_COLUMNS)):
+                cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                for name, ddl in extra.items():
+                    if name not in cols:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -420,7 +441,7 @@ class SQLiteStore(Store):
         return dict(row) if row else None
 
     def update_share(self, share_id: int, fields: dict) -> dict | None:
-        allowed = {"final_text", "status", "sent_at"}
+        allowed = {"final_text", "status", "sent_at", "photo_path"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return self.get_share(share_id)
@@ -439,6 +460,7 @@ class SQLiteStore(Store):
         for r in rows:
             letter = dict(r)
             letter["stamps"] = self.list_stamps(letter["id"])
+            letter["replies"] = self.list_replies(letter["id"])
             letters.append(letter)
         return letters
 
@@ -461,6 +483,34 @@ class SQLiteStore(Store):
         with self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM stamps WHERE share_id = ? ORDER BY id ASC", (share_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def toggle_stamp(self, share_id: int, from_user: str, stamp: str) -> bool:
+        with self._lock, self._conn() as c:
+            # 旧版の add_stamp で同じスタンプが重なっていることがあるので、外すときはまとめて消す
+            cur = c.execute("DELETE FROM stamps WHERE share_id = ? AND from_user = ? AND stamp = ?",
+                            (share_id, from_user, stamp))
+            if cur.rowcount > 0:
+                return False
+            c.execute("INSERT INTO stamps (share_id, from_user, stamp, created_at) VALUES (?, ?, ?, ?)",
+                      (share_id, from_user, stamp, _now()))
+            return True
+
+    # ---- letter replies --------------------------------------------------
+    def add_reply(self, share_id: int, from_user: str, body: str) -> dict:
+        with self._lock, self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO letter_replies (share_id, from_user, body, created_at) VALUES (?, ?, ?, ?)",
+                (share_id, from_user, body, _now()),
+            )
+            row = c.execute("SELECT * FROM letter_replies WHERE id = ?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+    def list_replies(self, share_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM letter_replies WHERE share_id = ? ORDER BY id ASC", (share_id,)
             ).fetchall()
         return [dict(r) for r in rows]
 

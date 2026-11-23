@@ -39,7 +39,10 @@ app.add_middleware(
 # /uploads/<名前>：ローカルは StaticFiles、GCS はバックエンドが読んで返すプロキシ（どちらも認証なし・uuid 名）
 upload_storage.mount(app)
 
-STAMPS = ["ありがとう", "うれしい", "元気そうで安心", "電話するね", "また聞かせて"]
+# 届いた便りへのリアクション（付け外しできる）。旧版のスタンプはそのままリアクションの種類として統合し、
+# 先頭に「いいね」を足した。保存先は従来どおり stamps 表（旧データのスタンプもリアクションとして見える）
+STAMPS = ["いいね", "ありがとう", "うれしい", "元気そうで安心", "電話するね", "また聞かせて"]
+REPLY_MAX_CHARS = 200
 
 PLACEHOLDER_DRAFT = "（AI下書きはまだありません。記録すると、ここに下書きができます）"
 
@@ -299,8 +302,9 @@ async def create_record(
     })
     if old:
         # 旧形式（H-6 修正前）のファイル名は同じ日の複数記録で共有されていることがあるので、
-        # 他の記録から参照されていないときだけ消す
+        # 他の記録から参照されていないときだけ消す。写真つきで送った便りが参照している写真も残す
         in_use = {r.get(k) for r in store.list_records(user_id) for k in ("audio_path", "photo_path")}
+        in_use |= {s.get("photo_path") for s in store.list_letters_sent_by(user_id)}
         for key in ("audio_path", "photo_path"):
             if old.get(key) and old[key] != rec.get(key) and old[key] not in in_use:
                 _remove_file(old[key])
@@ -453,20 +457,58 @@ class EditIn(BaseModel):
 
 class SendIn(BaseModel):
     final_text: str | None = None
+    include_photo: bool = False   # 「写真も一緒に届ける」。既定は届けない（本人がオンにしたときだけ）
 
 
 class StampIn(BaseModel):
     stamp: str
 
 
+class ReactionIn(BaseModel):
+    reaction: str
+
+
+class ReplyIn(BaseModel):
+    text: str
+
+
+def _unique_stamps(stamps: list[dict]) -> list[dict]:
+    """人×種類ごとに1つ（旧版の add_stamp で重なったものは最初の1つだけ残す）。"""
+    seen: set[tuple[str, str]] = set()
+    out = []
+    for st in stamps:
+        key = (st["from_user"], st["stamp"])
+        if key not in seen:
+            seen.add(key)
+            out.append(st)
+    return out
+
+
 def _with_names(share: dict) -> dict:
-    """便り・スタンプに表示名を付ける（フロントが相手の名前を出すため）。"""
+    """便り・リアクション・返信に表示名を付ける（フロントが相手の名前を出すため）。
+
+    写真は保存先の参照（photo_path）を出さず、本人が「写真も一緒に届ける」を選んで送った便りだけ公開URLを付ける。
+    """
     share = dict(share)
     share["from_name"] = _display_name(share["from_user"])
     share["to_name"] = _display_name(share["to_user"])
+    photo = share.pop("photo_path", None)
+    share["photo_url"] = uploads.public_url(photo) if share.get("status") == "sent" and photo else None
     if "stamps" in share:
-        share["stamps"] = [{**st, "from_name": _display_name(st["from_user"])} for st in share["stamps"]]
+        share["stamps"] = [{**st, "from_name": _display_name(st["from_user"])}
+                           for st in _unique_stamps(share["stamps"])]
+    if "replies" in share:
+        share["replies"] = [{**rp, "from_name": _display_name(rp["from_user"])} for rp in share["replies"]]
     return share
+
+
+def _with_record_photo(share: dict, user_id: str) -> dict:
+    """書いた本人向け（下書き・送信の応答）：もとの記録に写真があれば、その公開URLを付ける（トグルの表示用）。"""
+    out = _with_names(share)
+    rec = store.get_record(share["record_id"]) if share.get("record_id") else None
+    photo = rec.get("photo_path") if rec and rec["user_id"] == user_id else None
+    out["record_photo_url"] = uploads.public_url(photo) if photo else None
+    return out
 
 
 def _pick_recipient(user_id: str, to_user: str | None) -> str:
@@ -517,13 +559,13 @@ def create_draft(body: DraftIn, user_id: str = Depends(_uid)):
         "record_id": ana["record_id"] if ana else None,  # L-8: 実際に使った解析の記録IDに揃える
         "draft_text": draft,
     })
-    return _with_names(share)
+    return _with_record_photo(share, user_id)
 
 
 @app.patch("/api/shares/{share_id}")
 def edit_share(share_id: int, body: EditIn, user_id: str = Depends(_uid)):
     _owned_draft(share_id, user_id)
-    return _with_names(store.update_share(share_id, {"final_text": body.final_text}))
+    return _with_record_photo(store.update_share(share_id, {"final_text": body.final_text}), user_id)
 
 
 @app.post("/api/shares/{share_id}/send")
@@ -534,30 +576,76 @@ def send_share(share_id: int, body: SendIn, user_id: str = Depends(_uid)):
     text = body.final_text if body.final_text is not None else share["final_text"]
     if not _is_sendable(text):
         raise HTTPException(400, "送る内容が空か、下書きの案内文のままです。ひとこと書いてから送ってください。")
-    return _with_names(store.update_share(share_id, {
+    # 写真は本人が「写真も一緒に届ける」を選んだときだけ、送った時点の記録の写真を便りに写し取る
+    # （あとで同じ日の記録を撮り直しても、届いた便りの写真は送ったときのまま）
+    photo = None
+    if body.include_photo and share.get("record_id"):
+        rec = store.get_record(share["record_id"])
+        if rec and rec["user_id"] == user_id:
+            photo = rec.get("photo_path") or None
+    return _with_record_photo(store.update_share(share_id, {
         "final_text": text.strip(), "status": "sent",
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-    }))
+        "sent_at": datetime.now(timezone.utc).isoformat(), "photo_path": photo,
+    }), user_id)
 
 
 @app.get("/api/letters")
 def letters(user_id: str = Depends(_uid)):
-    """received: 自分に届いた便り / sent: 自分が送った便りと、それへのスタンプ返信（H-3）。"""
+    """received: 自分に届いた便り / sent: 自分が送った便りと、それへのリアクション・返信（H-3）。"""
     return {
         "received": [_with_names(s) for s in store.list_letters_for(user_id)],
         "sent": [_with_names(s) for s in store.list_letters_sent_by(user_id)],
     }
 
 
-@app.post("/api/letters/{share_id}/stamps")
-def add_stamp(share_id: int, body: StampIn, user_id: str = Depends(_uid)):
-    if body.stamp not in STAMPS:
-        raise HTTPException(400, f"unknown stamp: {body.stamp}")
+def _received_letter(share_id: int, user_id: str, what: str) -> dict:
+    """リアクション・返信ができるのは、その便りを受け取った、いま連携中の相手だけ。"""
     share = store.get_share(share_id)
     if not share or share["status"] != "sent":
         raise HTTPException(404, "letter not found")
     if user_id != share["to_user"]:
-        raise HTTPException(403, "スタンプを返せるのは、便りを受け取った人だけです")
+        raise HTTPException(403, f"{what}できるのは、便りを受け取った人だけです")
     if not store.are_linked(user_id, share["from_user"]):
         raise HTTPException(403, "この相手とは連携が解除されています")
+    return share
+
+
+def _letter_view(share_id: int) -> dict:
+    share = dict(store.get_share(share_id) or {})
+    share["stamps"] = store.list_stamps(share_id)
+    share["replies"] = store.list_replies(share_id)
+    return _with_names(share)
+
+
+@app.post("/api/letters/{share_id}/stamps")
+def add_stamp(share_id: int, body: StampIn, user_id: str = Depends(_uid)):
+    """旧版のスタンプ返信（付けるだけ）。いまはリアクションと同じもので、同じ種類は1つまで（付いていれば何もしない）。"""
+    if body.stamp not in STAMPS:
+        raise HTTPException(400, f"unknown stamp: {body.stamp}")
+    _received_letter(share_id, user_id, "スタンプを返す")
+    for st in store.list_stamps(share_id):
+        if st["from_user"] == user_id and st["stamp"] == body.stamp:
+            return st
     return store.add_stamp(share_id, user_id, body.stamp)
+
+
+@app.post("/api/letters/{share_id}/reactions")
+def toggle_reaction(share_id: int, body: ReactionIn, user_id: str = Depends(_uid)):
+    """リアクションの付け外し（トグル）。付いていなければ付け、付いていれば外す。"""
+    if body.reaction not in STAMPS:
+        raise HTTPException(400, f"unknown reaction: {body.reaction}")
+    _received_letter(share_id, user_id, "リアクション")
+    on = store.toggle_stamp(share_id, user_id, body.reaction)
+    return {"reaction": body.reaction, "on": on, "letter": _letter_view(share_id)}
+
+
+@app.post("/api/letters/{share_id}/replies")
+def add_reply(share_id: int, body: ReplyIn, user_id: str = Depends(_uid)):
+    _received_letter(share_id, user_id, "返信")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "返信が空です。ひとこと書いてから送ってください")
+    if len(text) > REPLY_MAX_CHARS:
+        raise HTTPException(400, f"返信は{REPLY_MAX_CHARS}字までです（いま{len(text)}字）")
+    reply = store.add_reply(share_id, user_id, text)
+    return {"reply": {**reply, "from_name": _display_name(user_id)}, "letter": _letter_view(share_id)}

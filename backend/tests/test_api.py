@@ -396,6 +396,160 @@ class TestSharing(Base):
 
 
 # --------------------------------------------------------------------------
+class TestLetterReactions(Base):
+    """届いた便りのリアクション（いいね＋旧スタンプ）・テキスト返信・写真の同送（#13）。"""
+
+    def _send(self, text="バラが咲いたよ", photo=False, include_photo=False):
+        files = {"photo": ("rose.png", PNG, "image/png")} if photo else None
+        rec = self.post_record(gratitude="庭のバラ", mood="元気", files=files).json()
+        self.c.post(f"/api/records/{rec['id']}/analyze")
+        s = self.c.post("/api/shares/draft", json={}).json()
+        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": text, "include_photo": include_photo})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json(), rec
+
+    def test_reaction_kinds_include_like_and_legacy_stamps(self):
+        kinds = self.c.get("/api/stamps").json()
+        self.assertEqual(kinds[0], "いいね")
+        for legacy in ("ありがとう", "うれしい", "元気そうで安心", "電話するね", "また聞かせて"):
+            self.assertIn(legacy, kinds)
+
+    def test_toggle_reaction_on_and_off(self):
+        s, _ = self._send()
+        url = f"/api/letters/{s['id']}/reactions"
+        r = self.d.post(url, json={"reaction": "いいね"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["on"])
+        self.assertEqual([x["stamp"] for x in r.json()["letter"]["stamps"]], ["いいね"])
+        self.d.post(url, json={"reaction": "電話するね"})
+        got = self.d.get("/api/letters").json()["received"][0]["stamps"]
+        self.assertEqual([x["stamp"] for x in got], ["いいね", "電話するね"])
+        # もう一度押すと外れる（種類ごとに1つまで）
+        r = self.d.post(url, json={"reaction": "いいね"})
+        self.assertFalse(r.json()["on"])
+        got = self.d.get("/api/letters").json()["received"][0]["stamps"]
+        self.assertEqual([x["stamp"] for x in got], ["電話するね"])
+        self.assertEqual(len(self.store.list_stamps(s["id"])), 1)
+        # 値域外は 400
+        self.assertEqual(self.d.post(url, json={"reaction": "<b>x</b>"}).status_code, 400)
+
+    def test_legacy_stamp_endpoint_is_idempotent_and_toggle_clears_duplicates(self):
+        s, _ = self._send()
+        for _ in range(2):
+            self.assertEqual(self.d.post(f"/api/letters/{s['id']}/stamps", json={"stamp": "うれしい"}).status_code, 200)
+        self.assertEqual(len(self.store.list_stamps(s["id"])), 1)
+        # 旧版で重なって保存されたスタンプも、表示では1つにまとめ、外すときはまとめて外す
+        self.store.add_stamp(s["id"], self.ids["daughter"], "うれしい")
+        got = self.c.get("/api/letters").json()["sent"][0]["stamps"]
+        self.assertEqual([x["stamp"] for x in got], ["うれしい"])
+        r = self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "うれしい"})
+        self.assertFalse(r.json()["on"])
+        self.assertEqual(self.store.list_stamps(s["id"]), [])
+
+    def test_only_linked_recipient_can_react_or_reply(self):
+        s, _ = self._send()
+        stranger, _ = self.register("他人", "stranger@example.com")
+        for cl, code in ((stranger, 403), (self.c, 403)):   # 未連携の他人・送った本人
+            self.assertEqual(cl.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "いいね"}).status_code, code)
+            self.assertEqual(cl.post(f"/api/letters/{s['id']}/replies", json={"text": "こんにちは"}).status_code, code)
+        # 他人には便りそのものも見えない
+        self.assertEqual(stranger.get("/api/letters").json(), {"received": [], "sent": []})
+        # 送っていない下書きには付けられない
+        draft = self.c.post("/api/shares/draft", json={}).json()
+        self.assertEqual(self.d.post(f"/api/letters/{draft['id']}/reactions", json={"reaction": "いいね"}).status_code, 404)
+        self.assertEqual(self.d.post(f"/api/letters/{draft['id']}/replies", json={"text": "x"}).status_code, 404)
+        # 連携を解除すると、受け取った人でもリアクション・返信できない（届いた便りは残る）
+        self.c.delete(f"/api/family/links/{self.ids['daughter']}")
+        self.assertEqual(self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "いいね"}).status_code, 403)
+        self.assertEqual(self.d.post(f"/api/letters/{s['id']}/replies", json={"text": "ありがとう"}).status_code, 403)
+        self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 1)
+        self.assertEqual(self.store.list_stamps(s["id"]), [])
+        self.assertEqual(self.store.list_replies(s["id"]), [])
+
+    def test_reply_saved_in_order_with_length_limit(self):
+        s, _ = self._send()
+        url = f"/api/letters/{s['id']}/replies"
+        r = self.d.post(url, json={"text": "  きれいだね！  "})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["reply"]["body"], "きれいだね！")   # 前後の空白は落とす
+        self.assertEqual(r.json()["reply"]["from_name"], "娘")
+        self.d.post(url, json={"text": "週末に見に行くね"})
+        # 空・上限超えは 400（200 字ちょうどは通る。絵文字も1字と数える）
+        self.assertEqual(self.d.post(url, json={"text": "   "}).status_code, 400)
+        r = self.d.post(url, json={"text": "あ" * 201})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("200字", r.json()["detail"])
+        self.assertEqual(self.d.post(url, json={"text": "🌹" * 200}).status_code, 200)
+        replies = self.d.get("/api/letters").json()["received"][0]["replies"]
+        self.assertEqual([x["body"] for x in replies], ["きれいだね！", "週末に見に行くね", "🌹" * 200])
+        self.assertTrue(all(x["from_user"] == self.ids["daughter"] for x in replies))
+
+    def test_sender_sees_reactions_and_replies(self):
+        s, _ = self._send()
+        self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "いいね"})
+        self.d.post(f"/api/letters/{s['id']}/replies", json={"text": "週末に見に行くね"})
+        sent = self.c.get("/api/letters").json()["sent"][0]
+        self.assertEqual([(x["stamp"], x["from_name"]) for x in sent["stamps"]], [("いいね", "娘")])
+        self.assertEqual([(x["body"], x["from_name"]) for x in sent["replies"]], [("週末に見に行くね", "娘")])
+        # 送った本人の「届いた便り」には自分の便りは入らない
+        self.assertEqual(self.c.get("/api/letters").json()["received"], [])
+
+    def test_photo_not_delivered_unless_opted_in(self):
+        s, rec = self._send(photo=True)   # 写真つきの記録でも、トグルオフ（既定）なら届かない
+        self.assertIsNone(s["photo_url"])
+        self.assertEqual(s["record_photo_url"], rec["photo_url"])   # 本人には写真があることだけ示す
+        letter = self.d.get("/api/letters").json()["received"][0]
+        self.assertIsNone(letter["photo_url"])
+        self.assertNotIn("photo_path", letter)
+        self.assertNotIn("record_photo_url", letter)
+        # 下書きの段階では、オンにしていても相手には何も見えない
+        draft = self.c.post("/api/shares/draft", json={}).json()
+        self.assertEqual(draft["record_photo_url"], rec["photo_url"])
+        self.assertIsNone(draft["photo_url"])
+
+    def test_photo_delivered_when_opted_in_and_kept_after_retake(self):
+        s, rec = self._send(photo=True, include_photo=True)
+        self.assertEqual(s["photo_url"], rec["photo_url"])
+        letter = self.d.get("/api/letters").json()["received"][0]
+        self.assertEqual(letter["photo_url"], rec["photo_url"])
+        self.assertNotIn("photo_path", letter)
+        self.assertEqual(self.d.get(letter["photo_url"]).content, PNG)
+        self.assertEqual(self.c.get("/api/letters").json()["sent"][0]["photo_url"], rec["photo_url"])
+        # リアクション・返信は写真つきの便りにも同じように付けられる
+        self.assertTrue(self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "いいね"}).json()["on"])
+        self.assertEqual(self.d.post(f"/api/letters/{s['id']}/replies", json={"text": "いい写真"}).status_code, 200)
+        # 同じ日の記録を撮り直しても、届いた便りの写真は送ったときのまま（ファイルも消さない）
+        r2 = self.post_record(gratitude="撮り直し", files={"photo": ("b.png", PNG + b"new", "image/png")}).json()
+        self.assertNotEqual(r2["photo_url"], rec["photo_url"])
+        letter = self.d.get("/api/letters").json()["received"][0]
+        self.assertEqual(letter["photo_url"], rec["photo_url"])
+        self.assertEqual(self.d.get(letter["photo_url"]).content, PNG)
+
+    def test_old_db_gets_reply_table_and_share_photo_column(self):
+        import sqlite3
+        path = os.path.join(self.dir, "old.db")
+        with sqlite3.connect(path) as c:   # 写真の列・返信の表がない旧版の shares
+            c.execute("CREATE TABLE shares (id INTEGER PRIMARY KEY AUTOINCREMENT, from_user TEXT NOT NULL,"
+                      " to_user TEXT NOT NULL, record_id INTEGER, draft_text TEXT NOT NULL DEFAULT '',"
+                      " final_text TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft',"
+                      " created_at TEXT NOT NULL, sent_at TEXT)")
+            c.execute("INSERT INTO shares (from_user, to_user, final_text, status, created_at)"
+                      " VALUES ('mother', 'daughter', '旧版の便り', 'sent', '2026-11-20T00:00:00+00:00')")
+        st = SQLiteStore(path)
+        letter = st.list_letters_for("daughter")[0]
+        self.assertIsNone(letter["photo_path"])
+        self.assertEqual(letter["replies"], [])
+        st.add_reply(letter["id"], "daughter", "届いたよ")
+        self.assertEqual(st.list_replies(letter["id"])[0]["body"], "届いたよ")
+
+    def test_include_photo_without_photo_is_harmless(self):
+        s, _ = self._send(include_photo=True)
+        self.assertIsNone(s["photo_url"])
+        self.assertIsNone(s["record_photo_url"])
+        self.assertIsNone(self.d.get("/api/letters").json()["received"][0]["photo_url"])
+
+
+# --------------------------------------------------------------------------
 class TestGeminiPath(Base):
     def setUp(self):
         super().setUp()
@@ -1242,7 +1396,8 @@ class TestAuth(Base):
         ("get", "/api/records/1"), ("post", "/api/records/1/analyze"), ("get", "/api/today-word"),
         ("get", "/api/dev/latest-analysis"), ("get", "/api/weekly"), ("post", "/api/shares/draft"),
         ("patch", "/api/shares/1"), ("post", "/api/shares/1/send"), ("get", "/api/letters"),
-        ("post", "/api/letters/1/stamps"), ("post", "/api/family/link"),
+        ("post", "/api/letters/1/stamps"), ("post", "/api/letters/1/reactions"),
+        ("post", "/api/letters/1/replies"), ("post", "/api/family/link"),
         ("delete", "/api/family/links/x"), ("post", "/api/auth/logout"),
     ]
 
