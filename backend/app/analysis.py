@@ -21,7 +21,12 @@ Gemini の出力はそのまま使わず、後段ガード（`guard_gemini`）�
   (c) ベースライン期間中の observations はサーバー側の定型観察文に差し替え
   (d) 健康への配慮が必要な文脈では、FIXED_CARE_PHRASE をサーバー側で付与
   (e) ベースライン期間中に今日の一言が変化に触れていたら（「いつもより」「最近」等）不採用→モック
-  (a)(e) は、本人の言葉をそのまま「」で引用した部分を除いて検査する。
+  (f) 疲れ・体調についての断定調（「疲れているようです」等。「かもしれ」や問いかけの形でない文）→ 不採用→モック
+  (a)(e) は、本人の言葉をそのまま「」で引用した部分を除いて検査する。(f) は直近の記録の言葉の引用も除く。
+
+直近の流れ（#9）：ベースライン後は、過去 RECENT_CONTEXT_DAYS 日の記録の要約（recent_days）と、
+変化検知ルールの発火結果から作った傾向の手がかり（trends）をプロンプトに添える。
+傾向がある日だけ、今日の映し返しに添えて「少し疲れているのかもしれませんね」程度のやわらかさで触れる。
 """
 from __future__ import annotations
 
@@ -77,7 +82,7 @@ SYSTEM_RULES = (
     "4. 締めは、答えを求めない短い問いかけにしてもよい（毎回でなくてよい）。\n"
     "書かないこと：アドバイスや指示（「〜しましょう」「〜してみては」等）、"
     "決まり文句の励まし（「がんばりましたね」等）、気持ちの断定、良し悪しの評価、"
-    "体調やその原因の推測。\n"
+    "体調の断定（「疲れているようです」「疲れていますね」等）やその原因の推測。\n"
     "長さは2〜3文、全体で120字程度まで。"
 )
 
@@ -100,6 +105,31 @@ _QUOTE_STOP = {
 }
 _HIRAGANA_ONLY = re.compile(r"^[぀-ゟ]+$")
 _STRIP = re.compile(r"[\s、。，．,.!！?？「」『』（）()・…〜~ー\-]+")
+
+# 直近の流れ（#9）：ベースライン後に、過去何日分の記録をプロンプトの文脈に入れるか（暦日）
+RECENT_CONTEXT_DAYS = 7
+
+# 傾向にふれるときの指示（直近の記録・傾向の手がかりを渡す日だけプロンプトに足す）
+TREND_RULES = (
+    "直近の記録は、今日を数日の流れの中で見るための参考です。"
+    "数日にわたる傾向（同じ言葉が続いている、言葉が短くなっている等）がはっきり読み取れるときだけ、"
+    "今日の言葉の映し返しに添えて、やわらかく一言だけ触れてください"
+    "（例：「ここ数日、『眠い』が続いていますね」「少し疲れているのかもしれませんね」）。"
+    "傾向は言い切らず、「〜かもしれませんね」の推し量りまでにします。"
+    "「疲れているようです」「疲れていますね」のような言い切り、原因の推測、評価、指示は書きません。"
+    "傾向がはっきりしない日は過去に触れず、今日の言葉の映し返しだけにしてください。"
+    "今日の言葉の引用は必ず入れます（過去の言葉だけを引用しない）。"
+)
+
+# (f) 疲れ・体調についての断定調。AI 自身の地の文で、これらの語を含む文は
+# 「かもしれ」等の推し量りか問いかけの形でなければ不採用にする。
+STATE_CUES = (
+    "疲れ", "つかれ", "疲労", "だるさ", "しんどさ", "眠そう", "ねむそう", "寝不足", "睡眠不足",
+    "眠れていな", "眠りが浅", "弱って", "落ち込んで", "無理をして", "無理して", "頑張りすぎ",
+    "がんばりすぎ", "体調", "調子が悪", "元気がな", "元気がありませ",
+)
+_HEDGE_MARKS = ("かもしれ", "でしょうか", "？", "?")
+_SENTENCE = re.compile(r"[^。！!？?\n]+[。！!？?]*")
 
 # アップロード時に許可している音声 MIME（main.py と同じ集合）
 AUDIO_MIMES = {"audio/webm", "audio/mp4", "audio/ogg"}
@@ -184,6 +214,16 @@ def has_quote(answer_texts: list[str], word: str) -> str | None:
     return best
 
 
+def find_assertive_state(*texts: str) -> list[str]:
+    """(f) 疲れ・体調を言い切っている文を返す（引用部分は呼び出し側で除いておく）。"""
+    hits: list[str] = []
+    for t in texts:
+        for sent in _SENTENCE.findall(t or ""):
+            if any(c in sent for c in STATE_CUES) and not any(h in sent for h in _HEDGE_MARKS):
+                hits.append(sent.strip())
+    return hits
+
+
 def baseline_observations(record: dict, baseline_day: int) -> list[str]:
     """(c) ベースライン期間のサーバー側定型観察文。"""
     g = _short(record.get("gratitude", ""))
@@ -233,6 +273,10 @@ def analyze(
     }
     change = rules.evaluate(history or [record])
     request["change_rules"] = {"fired": change["fired"], "care_context": change["care_context"]}
+    # 直近の流れ（#9）。ベースライン中は変化に触れないので、文脈も傾向も渡さない
+    request["recent_days"] = [] if in_baseline else recent_days(record, history or [record])
+    trends = [] if in_baseline else recent_trends(history or [record], change)
+    request["trends"] = trends
 
     result: dict | None = None
     if api_key:
@@ -252,7 +296,7 @@ def analyze(
             except Exception as exc:  # 次のモデルへ。全滅したらモック
                 last_error = exc
         if g is None:  # fall back to mock, but say so in the dev view
-            result = _analyze_mock(record, baseline_day, previous)
+            result = _analyze_mock(record, baseline_day, previous, trends)
             result["engine"] = "mock (gemini-error fallback)"
             result["fallback_reason"] = "gemini_error"
             result["response"]["gemini_error"] = _redact(str(last_error), api_key)
@@ -262,9 +306,9 @@ def analyze(
             request["model"] = g["response"]["model"]
             g["response"]["gemini_attempts"] = attempts
             # ガードは、どのモデルが応答しても同じものを通す
-            result = _apply_guards(g, record, baseline_day, previous)
+            result = _apply_guards(g, record, baseline_day, previous, trends, request["recent_days"])
     else:
-        result = _analyze_mock(record, baseline_day, previous)
+        result = _analyze_mock(record, baseline_day, previous, trends)
         result["fallback_reason"] = "no_api_key"
 
     # (c) ベースライン期間中は observations をサーバー定型文に差し替え（どのエンジンでも）
@@ -289,6 +333,55 @@ def analyze(
     return result
 
 
+def recent_days(record: dict, history: list[dict]) -> list[dict]:
+    """対象日の前 RECENT_CONTEXT_DAYS 日（暦日）の記録の要約。古い順・1日1件。
+
+    記録の項目（感謝・気分・声の文字起こし）だけを短く切って渡す。過去の「今日の一言」（AI の出力）は
+    入れない：AI が自分の言い回しをなぞらず、本人の言葉を映すため。
+    """
+    try:
+        today = date.fromisoformat(record["date"])
+    except (TypeError, ValueError):
+        return []
+    lo = date.fromordinal(today.toordinal() - RECENT_CONTEXT_DAYS).isoformat()
+    by_date: dict[str, dict] = {}
+    for r in sorted(history, key=lambda r: (r["date"], r.get("id") or 0)):
+        if lo <= r["date"] < record["date"]:
+            by_date[r["date"]] = r
+    out = []
+    for d in sorted(by_date):
+        r = by_date[d]
+        row = {"date": d, "gratitude": _short(r.get("gratitude", "")), "mood": _short(r.get("mood", ""), 30)}
+        if (r.get("transcript") or "").strip():
+            row["transcript"] = _short(r["transcript"], 40)
+        out.append(row)
+    return out
+
+
+def recent_trends(history: list[dict], change: dict) -> list[dict]:
+    """変化検知ルールの発火結果から、傾向の手がかりを日数つきで作る（rules.py の判定をそのまま使う）。
+
+    - word:<語>（同じことばが続く）→ {"kind": "word", "word": 語, "days": n}
+    - short_answers（回答が短めの日が続く）→ {"kind": "short_answers", "days": n}
+    感謝欄が空の日（empty_gratitude）は「続く変化」ではないので入れない。
+    日数の数え方はルールと同じ（ベースライン後の記録の、末尾からの連続数）。
+    """
+    days = rules._one_per_day(history)
+    after = days[rules.BASELINE_DAYS:]
+    out: list[dict] = []
+    for fired in change.get("fired", []):
+        if fired.startswith("word:"):
+            w = fired[len("word:"):]
+            n = rules._trailing(after, lambda r, w=w: w in rules._text(r))
+            out.append({"kind": "word", "word": w, "days": n})
+        elif fired == "short_answers":
+            baseline = days[:rules.BASELINE_DAYS]
+            limit = sum(rules._length(r) for r in baseline) / len(baseline) * rules.SHORT_RATIO
+            n = rules._trailing(after, lambda r: rules._length(r) <= limit)
+            out.append({"kind": "short_answers", "days": n})
+    return out
+
+
 def _redact(text: str, secret: str) -> str:
     return text.replace(secret, "***") if secret else text
 
@@ -298,7 +391,8 @@ def _answer_texts(record: dict, transcript: str = "") -> list[str]:
                         transcript or record.get("transcript", "")) if (t or "").strip()]
 
 
-def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | None) -> dict:
+def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | None,
+                  trends: list[dict] | None = None, recent: list[dict] | None = None) -> dict:
     """(a)(b): Gemini 出力の検査。不合格ならモックに差し替える。"""
     transcript = (g.get("transcript") or "").strip()
     rec_for_mock = {**record, "transcript": transcript or record.get("transcript", "")}
@@ -309,7 +403,7 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
         raw_obs = [raw_obs]
     observations = [str(o) for o in raw_obs]
 
-    guard: dict = {"ng_words": [], "quote": None, "baseline_change": [], "passed": False}
+    guard: dict = {"ng_words": [], "quote": None, "baseline_change": [], "assertive": [], "passed": False}
     reason = ""
     if not answers:
         # 文字も文字起こしも無い（声が聞き取れなかった等）→ 汎用文を出さずに案内
@@ -328,6 +422,14 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
                 guard["baseline_change"] = [w for w in BASELINE_CHANGE_WORDS if w in own[0]]
                 if guard["baseline_change"]:
                     reason = "guard_baseline_change"
+            if not reason:
+                # (f) 直近の記録の言葉を「」で引用した部分も除いて検査する（「疲れた」が続く、の引用で弾かない）
+                quoted_ok = answers + [t for r in (recent or [])
+                                       for t in (r.get("gratitude"), r.get("mood"), r.get("transcript")) if t]
+                targets = [word] + (observations if baseline_day > BASELINE_DAYS else [])  # ベースライン中の観察文は差し替えるので見ない
+                guard["assertive"] = find_assertive_state(*(strip_user_quotes(t, quoted_ok) for t in targets))
+                if guard["assertive"]:
+                    reason = "guard_assertive"
 
     if not reason:
         guard["passed"] = True
@@ -338,7 +440,7 @@ def _apply_guards(g: dict, record: dict, baseline_day: int, previous: dict | Non
             "transcript": transcript, "response": g["response"],
         }
 
-    result = _analyze_mock(rec_for_mock, baseline_day, previous)
+    result = _analyze_mock(rec_for_mock, baseline_day, previous, trends)
     if reason != "no_text":
         result["engine"] = "mock (guard fallback)"
         result["fallback_reason"] = reason
@@ -399,12 +501,13 @@ def _contrast_pair(mood: str) -> tuple[str, str] | None:
     return None
 
 
-def _mirror_word(gratitude: str, mood: str, spoken: str, turn: int) -> str:
+def _mirror_word(gratitude: str, mood: str, spoken: str, turn: int, trend: str = "") -> str:
+    """trend があれば（直近の傾向の一文）、締めの文の代わりにそれを置く（長さを保つため）。"""
     g = "" if gratitude.strip(_PART_STRIP) in _NO_GRATITUDE else gratitude
     m = mood
 
     def pick(*variants: str) -> str:  # 同じ型の日が続いても、隣り合う日で締めの文が変わるように
-        return variants[turn % len(variants)]
+        return trend or variants[turn % len(variants)]
 
     if m:
         pair = _contrast_pair(m)
@@ -436,8 +539,8 @@ def _mirror_word(gratitude: str, mood: str, spoken: str, turn: int) -> str:
         if _first_cue(m, _UP_CUES):
             hedge = _first_cue(m, _HEDGES)
             if hedge:
-                tail = (f"「{hedge[1]}」という言い方に、無理に盛らない、"
-                        "今のあなたのちょうどいい手ざわりが映っているようです。")
+                tail = trend or (f"「{hedge[1]}」という言い方に、無理に盛らない、"
+                                 "今のあなたのちょうどいい手ざわりが映っているようです。")
             elif g:
                 tail = pick(
                     "明るい気持ちのとき、自分が何に心を動かされるのか。今日の言葉がそっと教えてくれています。",
@@ -469,13 +572,38 @@ def _mirror_word(gratitude: str, mood: str, spoken: str, turn: int) -> str:
         return f"今日の気分は「{m}」。{tail}"
 
     if g:
-        return (f"今日は「{g}」に目が向きました。たくさんの出来事の中からそれを選んだところに、"
-                "今のあなたが大事にしているものが映っているようです。")
-    return (f"声で「{spoken}」と話してくれました。声に出したその言葉を、"
-            "もう一度自分で聞いてみると、何か見えてくるかもしれません。")
+        return f"今日は「{g}」に目が向きました。" + (trend or (
+            "たくさんの出来事の中からそれを選んだところに、今のあなたが大事にしているものが映っているようです。"))
+    return f"声で「{spoken}」と話してくれました。" + (trend or (
+        "声に出したその言葉を、もう一度自分で聞いてみると、何か見えてくるかもしれません。"))
 
 
-def _analyze_mock(record: dict, baseline_day: int, previous: dict | None) -> dict:
+# 傾向にふれる一文（モック）。言い切らず、推し量りは「〜かもしれませんね」まで。
+_TREND_SOFT = ("少し疲れているのかもしれませんね。", "このところ、少しお疲れなのかもしれませんね。")
+
+
+def _trend_sentence(trends: list[dict] | None, turn: int) -> str:
+    """rules の発火結果から作った傾向（recent_trends）を、やわらかい一文にする。無ければ空文字。"""
+    if not trends:
+        return ""
+    word = next((t for t in trends if t["kind"] == "word"), None)
+    short = next((t for t in trends if t["kind"] == "short_answers"), None)
+    soft = _TREND_SOFT[turn % len(_TREND_SOFT)]
+    if word:
+        n = word["days"]
+        # 「眠れ」のような語の切れ端は「」に入れず言い換える
+        what = "眠りについての言葉" if word["word"] == "眠れ" else f"「{word['word']}」という言葉"
+        rest = "が続き、言葉も短めになっています。" if short else "が続いています。"
+        return f"ここ{n}日、{what}{rest}{soft}"
+    return (f"ここ{short['days']}日、短めの言葉の日が続いていますね。"
+            "短いひと言にも、そのときの気持ちがそのまま映っています。")
+
+
+
+
+
+def _analyze_mock(record: dict, baseline_day: int, previous: dict | None,
+                  trends: list[dict] | None = None) -> dict:
     gratitude = _short(record.get("gratitude", ""))
     mood = _short(record.get("mood", ""), 30)
     spoken = _short(record.get("transcript", ""), 40)
@@ -486,7 +614,9 @@ def _analyze_mock(record: dict, baseline_day: int, previous: dict | None) -> dic
 
     kind, notice, todays_word = "word", "", None
     if gratitude or mood or spoken:
-        todays_word = _mirror_word(gratitude, mood, spoken, turn)
+        # 傾向はベースライン後だけ（analyze がベースライン中は空にして渡す。念のためここでも見る）
+        trend = _trend_sentence(trends, turn) if baseline_day > BASELINE_DAYS else ""
+        todays_word = _mirror_word(gratitude, mood, spoken, turn, trend)
     else:
         # 汎用文は出さない。案内文を、一言とは区別できる形で返す。
         kind, notice = "voice_notice", VOICE_NOTICE
@@ -539,7 +669,7 @@ def _gemini_prompt(request: dict, with_audio: bool) -> str:
         if with_audio else ""
     )
     return (
-        f"{SYSTEM_RULES}\n{baseline_note}\n{audio_note}"
+        f"{SYSTEM_RULES}\n{baseline_note}\n{audio_note}{_recent_block(request)}"
         f"質問: ①今日、感謝できることは？ ②今日の気分・体調を一言で言うと？\n"
         f"今日のメモ:\n- 感謝できること: {inputs['gratitude']}\n- 気分・体調: {inputs['mood']}\n"
         "体調についての助言・受診の勧め・病名は書かないでください（必要な定型文はアプリ側で付けます）。\n"
@@ -547,6 +677,33 @@ def _gemini_prompt(request: dict, with_audio: bool) -> str:
         "\"todays_word\": \"本人の言葉を「」で具体的に引用し、その裏の気持ちを映し返す2〜3文の一言\", "
         "\"observations\": [\"観察の箇条書き\"]}"
     )
+
+
+def _recent_block(request: dict) -> str:
+    """直近の記録と傾向の手がかり（#9）。ベースライン中・直近の記録が無い日は空文字（従来どおり）。"""
+    rows = request.get("recent_days") or []
+    trends = request.get("trends") or []
+    if request.get("baseline_period") or not (rows or trends):
+        return ""
+    lines = []
+    for r in rows:
+        d = r["date"][5:].replace("-", "/")
+        line = f"- {d}: 感謝「{r['gratitude'] or '（なし）'}」／気分「{r['mood'] or '（なし）'}」"
+        if r.get("transcript"):
+            line += f"／声「{r['transcript']}」"
+        lines.append(line)
+    hints = []
+    for t in trends:
+        if t["kind"] == "word":
+            hints.append(f"- 「{t['word']}」ということばが、ここ{t['days']}日続いている")
+        elif t["kind"] == "short_answers":
+            hints.append(f"- 回答がはじめの{BASELINE_DAYS}日間より短めの日が、ここ{t['days']}日続いている")
+    block = f"{TREND_RULES}\n"
+    if lines:
+        block += f"直近の記録（過去{RECENT_CONTEXT_DAYS}日、古い順。今日は含まない）:\n" + "\n".join(lines) + "\n"
+    block += ("アプリが言葉の一致だけで数えた傾向の手がかり:\n" + "\n".join(hints) + "\n" if hints
+              else "アプリが数えた傾向の手がかり: なし（はっきりした傾向がなければ、過去には触れない）\n")
+    return block
 
 
 class GeminiHTTPError(RuntimeError):

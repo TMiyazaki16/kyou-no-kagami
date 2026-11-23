@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -532,7 +533,8 @@ class TestGeminiPath(Base):
                        + [("天気", "元気。でも眠い")], end=self.today - timedelta(days=1))
         os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
         a, _, _ = self._analyze(
-            {"todays_word": "「眠い」と言いながらも「元気」な一日。", "observations": ["眠そうですね"]},
+            # 「眠そうですね」のような言い切りは (f) で不採用になるので、ことばの観察にしておく（#9）
+            {"todays_word": "「眠い」と言いながらも「元気」な一日。", "observations": ["『眠い』ということばが出てきています"]},
             mood="元気だけど眠い")
         self.assertEqual(a["engine"], "gemini")
         self.assertEqual(a["baseline_day"], 9)
@@ -811,6 +813,146 @@ class TestMirrorWord(unittest.TestCase):
         # 鏡としての返し方の指示（今回足した部分）には NG 語を含めない
         guidance = analysis.SYSTEM_RULES.split("『今日の一言』は日記の要約ではありません", 1)[1]
         self.assertEqual(analysis.find_ng_words(guidance), [])
+
+
+class TestRecentTrends(Base):
+    """今日の一言に直近数日の流れを映す（#9）。"""
+
+    STABLE = ("庭のバラがきれいに咲いて眺めていられたこと", "よく休めて体も軽く元気です")
+
+    def seed_trend(self):
+        """1〜7日目は安定、8日目（昨日）に「眠い」。今日（9日目）も「眠い」なら、ことば・短さの2ルールが発火する。"""
+        self.seed_days("mother", [self.STABLE] * 7 + [("天気", "元気。でも眠い")],
+                       end=self.today - timedelta(days=1))
+
+    def gemini(self, payload, **fields):
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        call, calls = fake_gemini(payload)
+        rec = self.post_record(**fields).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        return a, calls[0]["parts"][0]["text"] if calls else ""
+
+    def test_recent_context_and_trends_are_in_request_and_prompt(self):
+        self.seed_trend()
+        word = "「元気だけど眠い」の今日。ここ数日、『眠い』が続いていますね。少し疲れているのかもしれませんね。"
+        a, prompt = self.gemini({"todays_word": word, "observations": []}, mood="元気だけど眠い")
+        req = a["request"]
+        # 過去7日（暦日）の記録が古い順に入る。今日は含まない
+        expected = [(self.today - timedelta(days=k)).isoformat() for k in range(7, 0, -1)]
+        self.assertEqual([r["date"] for r in req["recent_days"]], expected)
+        self.assertEqual(req["recent_days"][-1]["mood"], "元気。でも眠い")
+        self.assertEqual(set(req["recent_days"][0]), {"date", "gratitude", "mood"})
+        self.assertEqual(req["trends"], [{"kind": "short_answers", "days": 2},
+                                         {"kind": "word", "word": "眠い", "days": 2}])
+        # プロンプトに文脈・傾向の手がかり・ふれ方の指示が入る
+        self.assertIn(analysis.TREND_RULES, prompt)
+        self.assertIn("直近の記録（過去7日、古い順。今日は含まない）", prompt)
+        y = self.today - timedelta(days=1)
+        self.assertIn(f"- {y.month:02d}/{y.day:02d}: 感謝「天気」／気分「元気。でも眠い」", prompt)
+        self.assertIn("「眠い」ということばが、ここ2日続いている", prompt)
+        # 傾向にやわらかく触れた一言はガードを通る
+        self.assertEqual(a["engine"], "gemini", a["response"].get("guard"))
+        self.assertEqual(a["todays_word"], word)
+        self.assertEqual(a["response"]["guard"]["assertive"], [])
+
+    def test_single_day_works_as_before(self):
+        a, prompt = self.gemini({"todays_word": "「庭のバラ」に心が動いた今日。", "observations": []},
+                                gratitude="庭のバラ", mood="元気")
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["request"]["recent_days"], [])
+        self.assertEqual(a["request"]["trends"], [])
+        self.assertNotIn(analysis.TREND_RULES, prompt)
+        self.assertNotIn("直近の記録", prompt)
+        # モックも従来どおり（傾向の文が入らない）
+        os.environ.pop("GEMINI_API_KEY")
+        rec = self.store.find_record(self.ids["mother"], self.today.isoformat())
+        m = main.run_analysis(rec)
+        self.assertNotRegex(m["todays_word"], r"ここ\d+日")
+
+    def test_no_context_during_baseline(self):
+        self.seed_days("mother", [("", "眠い")] * 4, end=self.today - timedelta(days=1))
+        a, prompt = self.gemini({"todays_word": "「眠い」と書いた今日。", "observations": []}, mood="眠い")
+        self.assertEqual(a["baseline_day"], 5)
+        self.assertEqual(a["request"]["recent_days"], [])
+        self.assertEqual(a["request"]["trends"], [])
+        self.assertNotIn("直近の記録", prompt)
+        self.assertIn("変化への言及はしないでください", prompt)
+        # モックもベースライン中は傾向に触れない
+        os.environ.pop("GEMINI_API_KEY")
+        m = main.run_analysis(self.store.find_record(self.ids["mother"], self.today.isoformat()))
+        self.assertNotRegex(m["todays_word"], r"ここ\d+日")
+        self.assertFalse(any(x in m["todays_word"] for x in analysis._TREND_SOFT))
+
+    def test_assertive_state_is_rejected(self):
+        self.seed_trend()
+        for word, obs in (
+            ("「元気だけど眠い」の今日。ここ数日、疲れているようです。", []),
+            ("「元気だけど眠い」の今日。疲れがたまっていますね。", []),
+            ("「元気だけど眠い」の今日。", ["眠そうですね"]),
+        ):
+            with self.subTest(word=word, obs=obs):
+                a, _ = self.gemini({"todays_word": word, "observations": obs}, mood="元気だけど眠い")
+                self.assertEqual(a["fallback_reason"], "guard_assertive")
+                self.assertEqual(a["engine"], "mock (guard fallback)")
+                self.assertTrue(a["response"]["guard"]["assertive"])
+                # 差し替えたモックは傾向にやわらかく触れる
+                self.assertIn("ここ2日、「眠い」という言葉が続き", a["todays_word"])
+                self.assertIn("「元気」と「眠い」", a["todays_word"])  # 今日の言葉の引用は残る
+
+    def test_find_assertive_state(self):
+        bad = ["疲れているようです。", "お疲れのようですね。", "眠そうですね。", "体調が良くないみたいです。",
+               "少し元気がないですね。", "疲れがたまっています。"]
+        ok = ["少し疲れているのかもしれませんね。", "少しお疲れなのかもしれませんね。", "疲れていませんか？",
+              "ここ数日、続いていますね。", "どちらが少し大きかったでしょう。", "「元気」と「眠い」が同居していますね。"]
+        for t in bad:
+            self.assertTrue(analysis.find_assertive_state(t), t)
+        for t in ok:
+            self.assertEqual(analysis.find_assertive_state(t), [], t)
+        # 直近の記録の言葉の引用は除いて検査する（引用だけで弾かない）
+        quoted = analysis.strip_user_quotes("ここ数日「なんだか疲れた」が続いていますね。", ["なんだか疲れた"])
+        self.assertEqual(analysis.find_assertive_state(quoted), [])
+
+    def test_mock_mentions_trend_softly_and_passes_guards(self):
+        self.seed_trend()
+        trends_all = [
+            [{"kind": "word", "word": "眠い", "days": 2}],
+            [{"kind": "word", "word": "眠い", "days": 3}, {"kind": "short_answers", "days": 3}],
+            [{"kind": "short_answers", "days": 2}],
+            [{"kind": "word", "word": "眠れ", "days": 2}],
+        ]
+        for g, m in TestMirrorWord.SAMPLES:
+            for trends in trends_all:
+                for d in ("2026-11-21", "2026-11-22"):
+                    with self.subTest(g=g, m=m, trends=trends, d=d):
+                        r = analysis._analyze_mock({"user_id": "mother", "date": d, "gratitude": g, "mood": m,
+                                                    "transcript": ""}, 10, None, trends)
+                        w = r["todays_word"]
+                        answers = [t for t in (g, m) if t]
+                        self.assertTrue(analysis.has_quote(answers, w), w)
+                        own = analysis.strip_user_quotes(w, answers)
+                        self.assertEqual(analysis.find_ng_words(own), [], w)
+                        self.assertEqual(analysis.find_assertive_state(own), [], w)
+                        self.assertIn(f"ここ{trends[0]['days']}日", w)
+                        self.assertNotIn("ようです", own.split("ここ", 1)[1])
+                        self.assertNotIn(analysis.FIXED_CARE_PHRASE, w)
+                        self.assertNotIn("「眠れ」", w)
+        # API 経由（キーなし）でも、9日目は傾向に触れる
+        rec = self.post_record(mood="元気だけど眠い").json()
+        a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(a["baseline_day"], 9)
+        self.assertIn("ここ2日、「眠い」という言葉が続き、言葉も短めになっています。", a["todays_word"])
+        self.assertIn("「元気」と「眠い」", a["todays_word"])
+
+    def test_trend_wording_has_no_assertive_or_ng_words(self):
+        no_examples = re.sub(r"「[^」]*」", "", analysis.TREND_RULES)
+        self.assertEqual(analysis.find_assertive_state(no_examples), [])
+        self.assertEqual(analysis.find_ng_words(analysis.TREND_RULES), [])
+        for soft in analysis._TREND_SOFT:
+            self.assertEqual(analysis.find_assertive_state(soft), [])
+            self.assertIn("かもしれませんね", soft)
+        self.assertNotIn("疲れているようです", analysis._trend_sentence(
+            [{"kind": "word", "word": "疲れ", "days": 2}], 0))
 
 
 class TestChangeRulesAndSeed(Base):
