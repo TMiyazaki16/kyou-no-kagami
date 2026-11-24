@@ -28,6 +28,14 @@ class DuplicateError(Exception):
         self.field = field
 
 
+class AlreadySentError(Exception):
+    """同じ記録（日）の便りを、同じ相手にもう送っている（取り消した便りは数えない）。"""
+
+    def __init__(self, to_users: list[str]):
+        super().__init__(f"already sent: {len(to_users)} recipient(s)")
+        self.to_users = to_users
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -79,11 +87,19 @@ class Store:
     def analysis_for_record(self, record_id: int) -> dict | None: raise NotImplementedError
 
     # shares / letters / stamps
-    def create_share(self, share: dict) -> dict: raise NotImplementedError
+    def create_letters(self, from_user: str, record_id: int, to_users: list[str], letter: dict) -> list[dict]:
+        """送信済みの便りを、宛先ごとに1通ずつ作る（同じトランザクション）。
+
+        letter は snapshot_json（フィードバックの引用。送信時点で固定）・comment・photo_path（・sent_at）。
+        同じ記録（record_id）の便りを同じ相手にもう送っていれば、1通も作らず AlreadySentError。
+        """
+        raise NotImplementedError
+    def sent_recipients(self, from_user: str, record_id: int) -> list[str]:
+        """この記録（日）の便りを、もう送っている相手の ID（取り消した便りは消えているので数えない）。"""
+        raise NotImplementedError
     def get_share(self, share_id: int) -> dict | None: raise NotImplementedError
-    def update_share(self, share_id: int, fields: dict) -> dict | None: raise NotImplementedError
     def delete_share(self, share_id: int) -> bool:
-        """便り（下書き・送信済み）を消す。付いたリアクション・返信も同じトランザクションで消す。消せたら True。"""
+        """便り（旧版の下書き・送信済み）を消す。付いたリアクション・返信も同じトランザクションで消す。消せたら True。"""
         raise NotImplementedError
     def list_letters_for(self, user_id: str) -> list[dict]: raise NotImplementedError
     def list_letters_sent_by(self, user_id: str) -> list[dict]: raise NotImplementedError
@@ -186,6 +202,9 @@ _ANALYSIS_EXTRA_COLUMNS = {
 _SHARE_EXTRA_COLUMNS = {
     # 送信時に本人が「写真も一緒に届ける」を選んだときだけ、記録の写真の参照を写し取る（既定は NULL＝届けない）
     "photo_path": "TEXT",
+    # 便りの中身（#35）：送信時点のフィードバックの引用（JSON。NULL は旧版の「編集した文面」の便り）と、本人のコメント
+    "snapshot_json": "TEXT",
+    "comment": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -429,31 +448,37 @@ class SQLiteStore(Store):
         return _analysis_row(row) if row else None
 
     # ---- shares / stamps -------------------------------------------------
-    def create_share(self, share: dict) -> dict:
+    def create_letters(self, from_user: str, record_id: int, to_users: list[str], letter: dict) -> list[dict]:
+        now = _now()
+        sent_at = letter.get("sent_at") or now   # seed_demo.py が過去の日付で作るときだけ指定する
         with self._lock, self._conn() as c:
-            cur = c.execute(
-                "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at, sent_at)"
-                " VALUES (?, ?, ?, ?, ?, 'draft', ?, NULL)",
-                (share["from_user"], share["to_user"], share.get("record_id"),
-                 share.get("draft_text", ""), share.get("draft_text", ""), _now()),
-            )
-            row = c.execute("SELECT * FROM shares WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return dict(row)
+            marks = ", ".join("?" for _ in to_users)
+            dup = [r["to_user"] for r in c.execute(
+                f"SELECT DISTINCT to_user FROM shares WHERE from_user = ? AND record_id = ? AND status = 'sent'"
+                f" AND to_user IN ({marks})", (from_user, record_id, *to_users)).fetchall()]
+            if dup:
+                raise AlreadySentError(dup)
+            ids = []
+            for to_user in to_users:
+                cur = c.execute(
+                    "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at,"
+                    " sent_at, photo_path, snapshot_json, comment) VALUES (?, ?, ?, '', ?, 'sent', ?, ?, ?, ?, ?)",
+                    (from_user, to_user, record_id, letter.get("comment", ""), now, sent_at,
+                     letter.get("photo_path"), letter["snapshot_json"], letter.get("comment", "")),
+                )
+                ids.append(cur.lastrowid)
+            return [dict(c.execute("SELECT * FROM shares WHERE id = ?", (i,)).fetchone()) for i in ids]
+
+    def sent_recipients(self, from_user: str, record_id: int) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute("SELECT DISTINCT to_user FROM shares WHERE from_user = ? AND record_id = ?"
+                             " AND status = 'sent'", (from_user, record_id)).fetchall()
+        return [r["to_user"] for r in rows]
 
     def get_share(self, share_id: int) -> dict | None:
         with self._conn() as c:
             row = c.execute("SELECT * FROM shares WHERE id = ?", (share_id,)).fetchone()
         return dict(row) if row else None
-
-    def update_share(self, share_id: int, fields: dict) -> dict | None:
-        allowed = {"final_text", "status", "sent_at", "photo_path"}
-        sets = {k: v for k, v in fields.items() if k in allowed}
-        if not sets:
-            return self.get_share(share_id)
-        clause = ", ".join(f"{k} = ?" for k in sets)
-        with self._lock, self._conn() as c:
-            c.execute(f"UPDATE shares SET {clause} WHERE id = ?", (*sets.values(), share_id))
-        return self.get_share(share_id)
 
     def delete_share(self, share_id: int) -> bool:
         with self._lock, self._conn() as c:

@@ -94,6 +94,42 @@ class Base(unittest.TestCase):
         data = {"gratitude": gratitude, "mood": mood, **extra}
         return self.clients[user].post("/api/records", data=data, files=files or {})
 
+    def make_record(self, user="mother", day_offset=0, gratitude="庭のバラ", mood="元気", photo=False, analyze=True):
+        """今日から day_offset 日前の記録を作って解析する（今日は API 経由、過去は Store に直接）。"""
+        if day_offset == 0:
+            files = {"photo": ("rose.png", PNG, "image/png")} if photo else None
+            rec = self.post_record(user=user, gratitude=gratitude, mood=mood, files=files).json()
+            if analyze:
+                self.clients[user].post(f"/api/records/{rec['id']}/analyze")
+            return rec
+        rec, _ = self.store.upsert_record({
+            "user_id": self.ids[user], "date": (self.today - timedelta(days=day_offset)).isoformat(),
+            "gratitude": gratitude, "mood": mood, "transcript": "", "audio_path": None, "photo_path": None,
+        })
+        if analyze:
+            main.run_analysis(rec)
+        return rec
+
+    def send_letter(self, user="mother", record=None, to=None, comment="", include_photo=False, **record_kw):
+        """記録（なければ make_record で作る）のフィードバックを家族に送る。(1通目の便り, 記録) を返す。"""
+        rec = record or self.make_record(user=user, **record_kw)
+        to = to or [self.ids["daughter" if user == "mother" else "mother"]]
+        r = self.clients[user].post("/api/shares", json={"record_id": rec["id"], "to_users": to,
+                                                         "comment": comment, "include_photo": include_photo})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["letters"][0], rec
+
+    def insert_legacy_share(self, record_id, text, status="sent", from_key="mother", to_key="daughter"):
+        """旧版（#35 より前）の便り：引用のスナップショットがなく、本文は編集した文面（final_text）。"""
+        import sqlite3
+        with sqlite3.connect(self.store.db_path) as c:
+            cur = c.execute(
+                "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at, sent_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (self.ids[from_key], self.ids[to_key], record_id, text, text, status,
+                 "2026-11-20T00:00:00+00:00", "2026-11-20T12:00:00+00:00" if status == "sent" else None))
+            return cur.lastrowid
+
     def seed_days(self, user, entries, end=None):
         """entries[i] = (gratitude, mood)。end を最終日として過去にさかのぼって記録・解析。"""
         end = end or self.today
@@ -274,65 +310,56 @@ class TestUploads(Base):
 
 # --------------------------------------------------------------------------
 class TestSharing(Base):
-    def _draft(self, user="mother"):
-        cl = self.clients[user]
-        rec = self.post_record(user=user, gratitude="庭のバラ", mood="元気").json()
-        cl.post(f"/api/records/{rec['id']}/analyze")
-        return cl.post("/api/shares/draft", json={}).json()
+    """家族への共有の基本：フィードバックの引用＋コメントを、本人が送ったときだけ届ける（#35）。"""
 
-    def test_draft_edit_send_lock(self):
-        s = self._draft()
-        self.assertEqual(s["status"], "draft")
-        self.assertIn("今日の一言", s["draft_text"])
-        self.assertEqual(s["to_user"], self.ids["daughter"])  # 連携相手が1人なら自動で宛先になる
+    def test_send_quote_and_comment(self):
+        s, rec = self.send_letter(comment="  バラが咲いたよ  ")
+        ana = self.store.analysis_for_record(rec["id"])
+        self.assertEqual(s["status"], "sent")
+        self.assertEqual(s["to_user"], self.ids["daughter"])
         self.assertEqual(s["to_name"], "娘")
-        # 他人（受け取る予定の娘でも）は編集・送信できない
-        r = self.d.patch(f"/api/shares/{s['id']}", json={"final_text": "x"})
-        self.assertEqual(r.status_code, 403)
-        r = self.d.post(f"/api/shares/{s['id']}/send", json={})
-        self.assertEqual(r.status_code, 403)
-        # 本文に user_id を入れても、認証ユーザー以外にはなれない
-        r = self.d.post(f"/api/shares/{s['id']}/send", json={"user_id": self.ids["mother"]})
-        self.assertEqual(r.status_code, 403)
-        # 本人の編集
-        r = self.c.patch(f"/api/shares/{s['id']}", json={"final_text": "バラが咲いたよ"})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["final_text"], "バラが咲いたよ")
-        # 空文字は送れない
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "  "})
-        self.assertEqual(r.status_code, 400)
-        # 送信
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "バラが咲いたよ"})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["status"], "sent")
-        sent_at = r.json()["sent_at"]
-        # 送信後ロック
-        r = self.c.patch(f"/api/shares/{s['id']}", json={"final_text": "書きかえ"})
-        self.assertEqual(r.status_code, 409)
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={})
-        self.assertEqual(r.status_code, 409)
-        got = self.store.get_share(s["id"])
-        self.assertEqual(got["final_text"], "バラが咲いたよ")
-        self.assertEqual(got["sent_at"], sent_at)
+        self.assertEqual(s["record_id"], rec["id"])
+        self.assertEqual(s["comment"], "バラが咲いたよ")   # 前後の空白は落とす
+        self.assertEqual(s["feedback"], {"date": rec["date"], "todays_word": ana["todays_word"],
+                                         "observations": ana["observations"]})
+        self.assertNotIn("snapshot_json", s)
+        got = self.d.get("/api/letters").json()["received"]
+        self.assertEqual([(x["id"], x["comment"], x["feedback"]) for x in got], [(s["id"], s["comment"], s["feedback"])])
 
-    def test_placeholder_cannot_be_sent(self):
-        s = self.d.post("/api/shares/draft", json={}).json()
-        self.assertEqual(s["final_text"], main.PLACEHOLDER_DRAFT)
-        r = self.d.post(f"/api/shares/{s['id']}/send", json={})
-        self.assertEqual(r.status_code, 400)
-        r = self.d.post(f"/api/shares/{s['id']}/send", json={"final_text": main.PLACEHOLDER_DRAFT})
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(self.c.get("/api/letters").json()["received"], [])
+    def test_raw_record_is_not_in_letter(self):
+        s, rec = self.send_letter(comment="")
+        letter = self.d.get("/api/letters").json()["received"][0]
+        for key in ("gratitude", "mood", "transcript", "audio_url", "audio_path"):
+            self.assertNotIn(key, letter)
+            self.assertNotIn(key, letter["feedback"])
+        self.assertEqual(set(letter["feedback"]), {"date", "todays_word", "observations"})
 
-    def test_draft_is_not_visible_until_sent(self):
-        s = self._draft()
+    def test_body_user_id_is_ignored(self):
+        rec = self.make_record(user="daughter", gratitude="娘の記録")
+        # 本文に user_id を入れても、認証ユーザー以外にはなれない（母の記録として送れない）
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]],
+                                             "user_id": self.ids["daughter"]})
+        self.assertEqual(r.status_code, 403)
         self.assertEqual(self.d.get("/api/letters").json()["received"], [])
-        self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "ok"})
+
+    def test_nothing_is_delivered_until_sent(self):
+        rec = self.make_record()
+        p = self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        self.assertIsNotNone(p["feedback"])
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])   # プレビューでは何も届かない
+        self.send_letter(record=rec)
         self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 1)
 
+    def test_old_draft_endpoints_are_gone(self):
+        rec = self.make_record()
+        self.assertIn(self.c.post("/api/shares/draft", json={"record_id": rec["id"]}).status_code, (404, 405))
+        s, _ = self.send_letter(record=rec)
+        self.assertIn(self.c.patch(f"/api/shares/{s['id']}", json={"final_text": "x"}).status_code, (404, 405))
+        self.assertIn(self.c.post(f"/api/shares/{s['id']}/send", json={}).status_code, (404, 405))
+        self.assertEqual(self.d.get("/api/letters").json()["received"][0]["comment"], "")
+
     def test_stamp_reply_visible_to_sender(self):
-        s = self._draft()
-        self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "バラが咲いたよ"})
+        s, _ = self.send_letter(comment="バラが咲いたよ")
         # 値域チェック
         r = self.d.post(f"/api/letters/{s['id']}/stamps", json={"stamp": "<b>hi</b>"})
         self.assertEqual(r.status_code, 400)
@@ -352,43 +379,50 @@ class TestSharing(Base):
         self.assertEqual(daughter["received"][0]["stamps"][0]["stamp"], "電話するね")
         self.assertEqual(daughter["received"][0]["from_name"], "母")
 
-    def test_stamp_on_unsent_draft_rejected(self):
-        s = self._draft()
-        r = self.d.post(f"/api/letters/{s['id']}/stamps", json={"stamp": "うれしい"})
-        self.assertEqual(r.status_code, 404)
+    def test_legacy_unsent_draft_rejects_stamp_and_is_invisible(self):
+        rec = self.make_record()
+        draft_id = self.insert_legacy_share(rec["id"], "旧版の下書き", status="draft")
+        self.assertEqual(self.d.post(f"/api/letters/{draft_id}/stamps", json={"stamp": "うれしい"}).status_code, 404)
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
+        # 旧版の下書きは「送信済み」に数えない（その日を新しい形で送れる）
+        self.assertFalse(self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["recipients"][0]["already_sent"])
+        self.send_letter(record=rec)
 
     def test_cannot_share_with_unlinked_user(self):
         stranger, stranger_id = self.register("他人", "stranger@example.com")
-        # 連携していない相手を宛先にはできない
-        r = self.c.post("/api/shares/draft", json={"to_user": stranger_id})
-        self.assertEqual(r.status_code, 403)
-        # 誰とも連携していない人は、下書きも作れない（送り先がない）
-        r = stranger.post("/api/shares/draft", json={})
+        rec = self.make_record()
+        # 連携していない相手を宛先にはできない（連携相手と混ぜても、だれにも送らない）
+        for to in ([stranger_id], [self.ids["daughter"], stranger_id]):
+            r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": to})
+            self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
+        # 誰とも連携していない人は送れない（送り先がない）
+        srec = stranger.post("/api/records", data={"gratitude": "紅茶", "mood": "元気"}).json()
+        stranger.post(f"/api/records/{srec['id']}/analyze")
+        r = stranger.post("/api/shares", json={"record_id": srec["id"], "to_users": [self.ids["mother"]]})
         self.assertEqual(r.status_code, 400)
-        r = stranger.post("/api/shares/draft", json={"to_user": self.ids["mother"]})
-        self.assertEqual(r.status_code, 403)
+        self.assertEqual(stranger.get(f"/api/shares/preview?record_id={srec['id']}").json()["recipients"], [])
         self.assertEqual(self.c.get("/api/letters").json()["received"], [])
 
-    def test_multiple_family_requires_choice(self):
-        _, son_id = self.register("息子", "son@example.com")
-        son_code = self.store.get_user(son_id)["family_code"]
-        self.c.post("/api/family/link", json={"code": son_code})
-        self.assertEqual(self.c.post("/api/shares/draft", json={}).status_code, 400)
-        s = self.c.post("/api/shares/draft", json={"to_user": son_id}).json()
-        self.assertEqual(s["to_user"], son_id)
+    def test_recipient_must_be_chosen(self):
+        rec = self.make_record()
+        for to in ([], [""]):
+            r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": to})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn("選んで", r.json()["detail"])
+        self.assertEqual(self.c.post("/api/shares", json={"record_id": rec["id"]}).status_code, 400)
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
 
     def test_unlink_blocks_send_and_stamp(self):
-        s = self._draft()
-        sent = self._draft()
-        self.c.post(f"/api/shares/{sent['id']}/send", json={"final_text": "前に送った便り"})
+        sent, _ = self.send_letter(day_offset=1, comment="前に送った便り")
+        rec = self.make_record()
         r = self.c.delete(f"/api/family/links/{self.ids['daughter']}")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["family"], [])
         self.assertEqual(self.d.get("/api/me").json()["family"], [])  # 相手側からも外れる
-        # 連携解除後は、作りかけの下書きも送れない
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "届く？"})
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(self.store.get_share(s["id"])["status"], "draft")
+        # 連携解除後は送れない
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]]})
+        self.assertIn(r.status_code, (400, 403))
         # 前に届いた便りは残るが、スタンプは返せない
         self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 1)
         r = self.d.post(f"/api/letters/{sent['id']}/stamps", json={"stamp": "うれしい"})
@@ -396,17 +430,195 @@ class TestSharing(Base):
 
 
 # --------------------------------------------------------------------------
+class TestShareQuote(Base):
+    """引用のスナップショット・コメント・複数宛て・二重送信チェック（#35）。"""
+
+    def link_son(self):
+        son, son_id = self.register("息子", "son@example.com")
+        self.c.post("/api/family/link", json={"code": self.store.get_user(son_id)["family_code"]})
+        return son, son_id
+
+    def test_empty_comment_can_be_sent(self):
+        for i, comment in enumerate(("", "   ")):
+            s, _ = self.send_letter(day_offset=i, comment=comment)
+            self.assertEqual(s["comment"], "")
+            self.assertTrue(s["feedback"]["todays_word"])
+        rec = self.make_record(day_offset=2)   # comment を省略しても送れる
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 3)
+
+    def test_comment_length_limit(self):
+        rec = self.make_record()
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]],
+                                             "comment": "あ" * 201})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("200字", r.json()["detail"])
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
+        s, _ = self.send_letter(record=rec, comment="🌹" * 200)   # 200 字ちょうどは通る（絵文字も1字）
+        self.assertEqual(s["comment"], "🌹" * 200)
+
+    def test_snapshot_does_not_change_after_send(self):
+        s, rec = self.send_letter(comment="バラが咲いたよ", gratitude="庭のバラ", mood="元気")
+        before = s["feedback"]
+        self.assertIn("庭のバラ", before["todays_word"])
+        # 同じ日の記録を書き直して解析し直しても、届いた便りの引用は送ったときのまま
+        rec2 = self.post_record(gratitude="雨の音", mood="少し眠い").json()
+        self.assertEqual(rec2["id"], rec["id"])
+        new = self.c.post(f"/api/records/{rec2['id']}/analyze").json()
+        self.assertNotEqual(new["todays_word"], before["todays_word"])
+        for letters in (self.d.get("/api/letters").json()["received"], self.c.get("/api/letters").json()["sent"]):
+            self.assertEqual(letters[0]["feedback"], before)
+            self.assertEqual(letters[0]["comment"], "バラが咲いたよ")
+        # プレビューは今の解析を映す（便りとは別）
+        p = self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        self.assertEqual(p["feedback"]["todays_word"], new["todays_word"])
+
+    def test_multiple_recipients_get_independent_letters(self):
+        son, son_id = self.link_son()
+        rec = self.make_record()
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "comment": "みんなへ",
+                                             "to_users": [self.ids["daughter"], son_id, son_id]})
+        self.assertEqual(r.status_code, 200, r.text)
+        letters = r.json()["letters"]
+        self.assertEqual(sorted(x["to_user"] for x in letters), sorted([self.ids["daughter"], son_id]))  # 重複は1通に
+        self.assertEqual(len({x["id"] for x in letters}), 2)
+        self.assertTrue(all(x["comment"] == "みんなへ" and x["feedback"] == letters[0]["feedback"] for x in letters))
+        to_d = next(x for x in letters if x["to_user"] == self.ids["daughter"])
+        to_s = next(x for x in letters if x["to_user"] == son_id)
+        # それぞれ自分あての1通だけが見える
+        self.assertEqual([x["id"] for x in self.d.get("/api/letters").json()["received"]], [to_d["id"]])
+        self.assertEqual([x["id"] for x in son.get("/api/letters").json()["received"]], [to_s["id"]])
+        # リアクション・返信は便りごとに独立（相手の便りには付けられない）
+        self.d.post(f"/api/letters/{to_d['id']}/reactions", json={"reaction": "いいね"})
+        self.assertEqual(son.post(f"/api/letters/{to_d['id']}/replies", json={"text": "x"}).status_code, 403)
+        son.post(f"/api/letters/{to_s['id']}/replies", json={"text": "見たよ"})
+        sent = {x["id"]: x for x in self.c.get("/api/letters").json()["sent"]}
+        self.assertEqual([x["stamp"] for x in sent[to_d["id"]]["stamps"]], ["いいね"])
+        self.assertEqual(sent[to_d["id"]]["replies"], [])
+        self.assertEqual(sent[to_s["id"]]["stamps"], [])
+        self.assertEqual([x["body"] for x in sent[to_s["id"]]["replies"]], ["見たよ"])
+        # 1通を取り消しても、もう1通は残る
+        self.c.delete(f"/api/letters/{to_d['id']}")
+        self.assertEqual([x["id"] for x in son.get("/api/letters").json()["received"]], [to_s["id"]])
+
+    def test_duplicate_send_is_blocked(self):
+        s, rec = self.send_letter(comment="一回目")
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]],
+                                             "comment": "二回目"})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("娘には、この日の便りをもう送っています", r.json()["detail"])
+        self.assertEqual([x["comment"] for x in self.d.get("/api/letters").json()["received"]], ["一回目"])
+        # 共有画面を開いた時点で、送信済みの相手が分かる
+        p = self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        self.assertEqual(p["recipients"], [{"id": self.ids["daughter"], "display_name": "娘", "already_sent": True}])
+        # 別の日なら同じ相手にも送れる
+        self.send_letter(day_offset=1)
+
+    def test_duplicate_in_multi_send_blocks_all(self):
+        son, son_id = self.link_son()
+        _, rec = self.send_letter()   # 娘には送信済み
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [son_id, self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("娘", r.json()["detail"])
+        self.assertNotIn("息子", r.json()["detail"])
+        self.assertEqual(son.get("/api/letters").json()["received"], [])   # 1人でも送信済みなら、だれにも送らない
+        recips = {x["id"]: x["already_sent"] for x in self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["recipients"]}
+        self.assertEqual(recips, {self.ids["daughter"]: True, son_id: False})
+        # 未送信の相手だけを選べば送れる
+        self.send_letter(record=rec, to=[son_id])
+        self.assertEqual(len(son.get("/api/letters").json()["received"]), 1)
+
+    def test_resend_allowed_after_retract(self):
+        s, rec = self.send_letter(comment="間違えた")
+        self.d.post(f"/api/letters/{s['id']}/replies", json={"text": "？"})
+        self.assertEqual(self.c.delete(f"/api/letters/{s['id']}").status_code, 200)
+        p = self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        self.assertFalse(p["recipients"][0]["already_sent"])   # 取り消した便りは数えない
+        s2, _ = self.send_letter(record=rec, comment="直して送り直し")
+        self.assertNotEqual(s2["id"], s["id"])
+        got = self.d.get("/api/letters").json()["received"]
+        self.assertEqual([(x["comment"], x["replies"]) for x in got], [("直して送り直し", [])])
+
+    def test_preview(self):
+        rec = self.make_record(photo=True)
+        p = self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        ana = self.store.analysis_for_record(rec["id"])
+        self.assertEqual(p["record_id"], rec["id"])
+        self.assertEqual(p["date"], rec["date"])
+        self.assertEqual(p["feedback"], {"date": rec["date"], "todays_word": ana["todays_word"],
+                                         "observations": ana["observations"]})
+        self.assertEqual(p["unavailable"], "")
+        self.assertEqual(p["record_photo_url"], rec["photo_url"])
+        self.assertEqual(p["recipients"], [{"id": self.ids["daughter"], "display_name": "娘", "already_sent": False}])
+        self.assertNotIn("gratitude", p)
+        self.assertNotIn("mood", p)
+
+    def test_preview_and_send_permissions(self):
+        theirs = self.make_record(user="daughter", gratitude="娘の記録")
+        self.assertEqual(self.c.get(f"/api/shares/preview?record_id={theirs['id']}").status_code, 403)
+        self.assertEqual(self.c.get("/api/shares/preview?record_id=99999").status_code, 404)
+        self.assertEqual(self.anon.get(f"/api/shares/preview?record_id={theirs['id']}").status_code, 401)
+        self.assertEqual(self.c.post("/api/shares", json={"record_id": 99999,
+                                                          "to_users": [self.ids["daughter"]]}).status_code, 404)
+        self.assertEqual(self.anon.post("/api/shares", json={"record_id": theirs["id"],
+                                                             "to_users": [self.ids["daughter"]]}).status_code, 401)
+
+    def test_day_without_feedback_cannot_be_sent(self):
+        self.make_record()                                     # 今日は解析あり
+        past = self.make_record(day_offset=3, analyze=False)   # 3日前は解析なし（別の日の一言を借りない）
+        p = self.c.get(f"/api/shares/preview?record_id={past['id']}").json()
+        self.assertIsNone(p["feedback"])
+        self.assertIn("鏡の言葉", p["unavailable"])
+        r = self.c.post("/api/shares", json={"record_id": past["id"], "to_users": [self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("鏡の言葉", r.json()["detail"])
+        # 上書きしてまだ解析し直していない日も送れない
+        rec = self.make_record()
+        self.post_record(gratitude="書き直し", mood="元気")
+        self.assertIsNone(self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["feedback"])
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
+
+    def test_voice_notice_day_cannot_be_sent(self):
+        rec = self.make_record(analyze=False)
+        self.store.save_analysis({
+            "record_id": rec["id"], "user_id": self.ids["mother"], "date": rec["date"],
+            "todays_word": "", "observations": [], "engine": "mock", "baseline_day": 1,
+            "request": {}, "response": {}, "kind": "voice_notice", "notice": "声が聞き取れませんでした",
+            "fallback_reason": "",
+        })
+        self.assertIsNone(self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["feedback"])
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 400)
+
+    def test_past_record_can_be_shared(self):
+        past = self.make_record(day_offset=2, gratitude="友だちの電話", mood="おだやか")
+        self.make_record(gratitude="庭のバラ", mood="元気")
+        s, _ = self.send_letter(record=past, comment="おとといの話")
+        word = self.store.analysis_for_record(past["id"])["todays_word"]
+        self.assertEqual(s["feedback"]["date"], "2026-11-20")
+        self.assertEqual(s["feedback"]["todays_word"], word)
+        self.assertEqual(self.d.get("/api/letters").json()["received"][0]["comment"], "おとといの話")
+
+    def test_legacy_sent_letter_is_shown_as_text_and_counts_as_sent(self):
+        rec = self.make_record()
+        sid = self.insert_legacy_share(rec["id"], "旧版の便り")
+        letter = self.d.get("/api/letters").json()["received"][0]
+        self.assertEqual((letter["id"], letter["feedback"], letter["comment"], letter["final_text"]),
+                         (sid, None, "", "旧版の便り"))
+        # 旧版で送った日も、同じ相手には送信済みとして扱う（取り消せば送り直せる）
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 409)
+        self.c.delete(f"/api/letters/{sid}")
+        self.send_letter(record=rec)
+
+
+# --------------------------------------------------------------------------
 class TestLetterReactions(Base):
     """届いた便りのリアクション（いいね＋旧スタンプ）・テキスト返信・写真の同送（#13）。"""
 
     def _send(self, text="バラが咲いたよ", photo=False, include_photo=False):
-        files = {"photo": ("rose.png", PNG, "image/png")} if photo else None
-        rec = self.post_record(gratitude="庭のバラ", mood="元気", files=files).json()
-        self.c.post(f"/api/records/{rec['id']}/analyze")
-        s = self.c.post("/api/shares/draft", json={}).json()
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": text, "include_photo": include_photo})
-        self.assertEqual(r.status_code, 200, r.text)
-        return r.json(), rec
+        return self.send_letter(comment=text, photo=photo, include_photo=include_photo)
 
     def test_reaction_kinds_include_like_and_legacy_stamps(self):
         kinds = self.c.get("/api/stamps").json()
@@ -454,8 +666,8 @@ class TestLetterReactions(Base):
             self.assertEqual(cl.post(f"/api/letters/{s['id']}/replies", json={"text": "こんにちは"}).status_code, code)
         # 他人には便りそのものも見えない
         self.assertEqual(stranger.get("/api/letters").json(), {"received": [], "sent": []})
-        # 送っていない下書きには付けられない
-        draft = self.c.post("/api/shares/draft", json={}).json()
+        # 送っていない（旧版の）下書きには付けられない
+        draft = {"id": self.insert_legacy_share(s["record_id"], "旧版の下書き", status="draft")}
         self.assertEqual(self.d.post(f"/api/letters/{draft['id']}/reactions", json={"reaction": "いいね"}).status_code, 404)
         self.assertEqual(self.d.post(f"/api/letters/{draft['id']}/replies", json={"text": "x"}).status_code, 404)
         # 連携を解除すると、受け取った人でもリアクション・返信できない（届いた便りは残る）
@@ -495,17 +707,20 @@ class TestLetterReactions(Base):
         self.assertEqual(self.c.get("/api/letters").json()["received"], [])
 
     def test_photo_not_delivered_unless_opted_in(self):
-        s, rec = self._send(photo=True)   # 写真つきの記録でも、トグルオフ（既定）なら届かない
-        self.assertIsNone(s["photo_url"])
-        self.assertEqual(s["record_photo_url"], rec["photo_url"])   # 本人には写真があることだけ示す
+        rec = self.make_record(photo=True)
+        # 本人には（共有画面のプレビューで）写真があることだけ示す。相手にはまだ何も見えない
+        self.assertEqual(self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["record_photo_url"],
+                         rec["photo_url"])
+        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
+        # 写真つきの記録でも、include_photo を省略（既定オフ）すれば届かない
+        r = self.c.post("/api/shares", json={"record_id": rec["id"], "to_users": [self.ids["daughter"]]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(r.json()["letters"][0]["photo_url"])
         letter = self.d.get("/api/letters").json()["received"][0]
         self.assertIsNone(letter["photo_url"])
         self.assertNotIn("photo_path", letter)
         self.assertNotIn("record_photo_url", letter)
-        # 下書きの段階では、オンにしていても相手には何も見えない
-        draft = self.c.post("/api/shares/draft", json={}).json()
-        self.assertEqual(draft["record_photo_url"], rec["photo_url"])
-        self.assertIsNone(draft["photo_url"])
+        self.assertIsNone(self.store.get_share(letter["id"])["photo_path"])
 
     def test_photo_delivered_when_opted_in_and_kept_after_retake(self):
         s, rec = self._send(photo=True, include_photo=True)
@@ -543,110 +758,18 @@ class TestLetterReactions(Base):
         self.assertEqual(st.list_replies(letter["id"])[0]["body"], "届いたよ")
 
     def test_include_photo_without_photo_is_harmless(self):
-        s, _ = self._send(include_photo=True)
+        s, rec = self._send(include_photo=True)
         self.assertIsNone(s["photo_url"])
-        self.assertIsNone(s["record_photo_url"])
+        self.assertIsNone(self.c.get(f"/api/shares/preview?record_id={rec['id']}").json()["record_photo_url"])
         self.assertIsNone(self.d.get("/api/letters").json()["received"][0]["photo_url"])
 
 
 # --------------------------------------------------------------------------
 class TestShareDeleteAndPickRecord(Base):
-    """下書きの破棄・記録を選んだ下書き・便りの送信取り消し・返信の削除（#21）。"""
+    """便りの送信取り消し・返信の削除（#21）。下書きの破棄・記録を選んだ下書きは #35 で廃止（TestShareQuote へ）。"""
 
-    def _record(self, day_offset=0, gratitude="庭のバラ", mood="元気", photo=False, analyze=True):
-        """今日から day_offset 日前の母の記録を作る（今日は API 経由、過去は Store に直接）。"""
-        if day_offset == 0:
-            files = {"photo": ("rose.png", PNG, "image/png")} if photo else None
-            rec = self.post_record(gratitude=gratitude, mood=mood, files=files).json()
-            if analyze:
-                self.c.post(f"/api/records/{rec['id']}/analyze")
-            return rec
-        rec, _ = self.store.upsert_record({
-            "user_id": self.ids["mother"], "date": (self.today - timedelta(days=day_offset)).isoformat(),
-            "gratitude": gratitude, "mood": mood, "transcript": "", "audio_path": None, "photo_path": None,
-        })
-        if analyze:
-            main.run_analysis(rec)
-        return rec
-
-    def _sent(self, text="バラが咲いたよ", photo=False, include_photo=False):
-        rec = self._record(photo=photo)
-        s = self.c.post("/api/shares/draft", json={"record_id": rec["id"]}).json()
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": text, "include_photo": include_photo})
-        self.assertEqual(r.status_code, 200, r.text)
-        return r.json(), rec
-
-    # ---- 下書きの破棄 ----------------------------------------------------
-    def test_discard_own_draft(self):
-        self._record()
-        s = self.c.post("/api/shares/draft", json={}).json()
-        r = self.c.delete(f"/api/shares/{s['id']}")
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json(), {"ok": True, "deleted": s["id"]})
-        self.assertIsNone(self.store.get_share(s["id"]))
-        # 消えた下書きは編集・送信・再破棄できない
-        self.assertEqual(self.c.patch(f"/api/shares/{s['id']}", json={"final_text": "x"}).status_code, 404)
-        self.assertEqual(self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "x"}).status_code, 404)
-        self.assertEqual(self.c.delete(f"/api/shares/{s['id']}").status_code, 404)
-        self.assertEqual(self.d.get("/api/letters").json()["received"], [])
-
-    def test_cannot_discard_others_draft_or_sent_letter(self):
-        self._record()
-        s = self.c.post("/api/shares/draft", json={}).json()
-        stranger, _ = self.register("他人", "stranger@example.com")
-        for cl in (self.d, stranger):   # 宛先の娘でも、他人でも消せない
-            self.assertEqual(cl.delete(f"/api/shares/{s['id']}").status_code, 403)
-        self.assertEqual(self.anon.delete(f"/api/shares/{s['id']}").status_code, 401)
-        self.assertEqual(self.store.get_share(s["id"])["status"], "draft")
-        # 送信済みの便りは、下書きの破棄では消せない（取り消しは /api/letters の DELETE）
-        self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "届いた？"})
-        r = self.c.delete(f"/api/shares/{s['id']}")
-        self.assertEqual(r.status_code, 409)
-        self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 1)
-
-    # ---- 記録（日付）を選んで下書き ------------------------------------------
-    def test_draft_from_past_record(self):
-        past = self._record(day_offset=2, gratitude="友だちの電話", mood="おだやか")
-        today = self._record(gratitude="庭のバラ", mood="元気")
-        s = self.c.post("/api/shares/draft", json={"record_id": past["id"]}).json()
-        self.assertEqual(s["record_id"], past["id"])
-        word = self.store.analysis_for_record(past["id"])["todays_word"]
-        self.assertEqual(s["draft_text"], f"11月20日の一言：{word}")
-        # 今日の記録を選べば従来どおり「今日の一言」
-        s2 = self.c.post("/api/shares/draft", json={"record_id": today["id"]}).json()
-        self.assertEqual(s2["record_id"], today["id"])
-        self.assertTrue(s2["draft_text"].startswith("今日の一言："))
-        # 過去の記録の下書きも、送れば相手に届く
-        r = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "おとといの話"})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(self.d.get("/api/letters").json()["received"][0]["final_text"], "おとといの話")
-
-    def test_draft_from_record_without_analysis_does_not_borrow_other_day(self):
-        self._record()                                     # 今日は解析あり
-        past = self._record(day_offset=3, analyze=False)   # 3日前は解析なし
-        s = self.c.post("/api/shares/draft", json={"record_id": past["id"]}).json()
-        self.assertEqual(s["record_id"], past["id"])
-        self.assertEqual(s["draft_text"], main.PLACEHOLDER_DRAFT)
-
-    def test_draft_record_permissions(self):
-        theirs = self.post_record(user="daughter", gratitude="娘の記録", mood="元気").json()
-        self.assertEqual(self.c.post("/api/shares/draft", json={"record_id": theirs["id"]}).status_code, 403)
-        self.assertEqual(self.c.post("/api/shares/draft", json={"record_id": 99999}).status_code, 404)
-
-    def test_draft_from_past_record_with_photo_toggle(self):
-        rec = self._record(photo=True)
-        # 写真つきの記録を日付をずらして過去の記録にする（記録の写真の参照はそのまま）
-        old = self.store.get_record(rec["id"])
-        past, _ = self.store.upsert_record({**{k: old[k] for k in ("gratitude", "mood", "transcript",
-                                            "audio_path", "photo_path")},
-                                            "user_id": self.ids["mother"],
-                                            "date": (self.today - timedelta(days=1)).isoformat()})
-        main.run_analysis(past)
-        s = self.c.post("/api/shares/draft", json={"record_id": past["id"]}).json()
-        self.assertEqual(s["record_photo_url"], rec["photo_url"])
-        self.assertIsNone(s["photo_url"])
-        sent = self.c.post(f"/api/shares/{s['id']}/send", json={"final_text": "写真なし"}).json()
-        self.assertIsNone(sent["photo_url"])   # 既定オフ：写真は届かない
+    def _sent(self, text="バラが咲いたよ", photo=False, include_photo=False, day_offset=0):
+        return self.send_letter(comment=text, photo=photo, include_photo=include_photo, day_offset=day_offset)
 
     # ---- 便りの送信取り消し -------------------------------------------------
     def test_sender_can_retract_letter_with_cascade(self):
@@ -654,7 +777,7 @@ class TestShareDeleteAndPickRecord(Base):
         self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "いいね"})
         self.d.post(f"/api/letters/{s['id']}/reactions", json={"reaction": "電話するね"})
         self.d.post(f"/api/letters/{s['id']}/replies", json={"text": "見に行くね"})
-        keep, _ = self._sent(text="残す便り")
+        keep, _ = self._sent(text="残す便り", day_offset=1)   # 同じ日・同じ相手には1回だけなので別の日
         self.d.post(f"/api/letters/{keep['id']}/replies", json={"text": "こっちは残る"})
 
         r = self.c.delete(f"/api/letters/{s['id']}")
@@ -681,8 +804,8 @@ class TestShareDeleteAndPickRecord(Base):
         self.assertEqual(self.anon.delete(f"/api/letters/{s['id']}").status_code, 401)
         self.assertEqual(len(self.d.get("/api/letters").json()["received"]), 1)
         self.assertEqual(len(self.store.list_replies(s["id"])), 1)
-        # 下書きは「便りの取り消し」の対象ではない（破棄は /api/shares の DELETE）
-        draft = self.c.post("/api/shares/draft", json={}).json()
+        # 旧版の下書き（送っていないもの）は「便りの取り消し」の対象ではない
+        draft = {"id": self.insert_legacy_share(s["record_id"], "旧版の下書き", status="draft")}
         self.assertEqual(self.c.delete(f"/api/letters/{draft['id']}").status_code, 404)
         self.assertEqual(self.store.get_share(draft["id"])["status"], "draft")
 
@@ -713,7 +836,7 @@ class TestShareDeleteAndPickRecord(Base):
             self.assertEqual(cl.delete(f"/api/letters/{s['id']}/replies/{mine['id']}").status_code, 403)
         self.assertEqual(self.anon.delete(f"/api/letters/{s['id']}/replies/{mine['id']}").status_code, 401)
         # 便りと返信の組が合わないものは 404
-        other, _ = self._sent(text="別の便り")
+        other, _ = self._sent(text="別の便り", day_offset=1)
         self.assertEqual(self.d.delete(f"/api/letters/{other['id']}/replies/{mine['id']}").status_code, 404)
         self.assertEqual(self.d.delete(f"/api/letters/{s['id']}/replies/99999").status_code, 404)
         # 本人は消せる。応答に更新後の便りを返す
@@ -1856,8 +1979,9 @@ class TestAuth(Base):
     PROTECTED = [
         ("get", "/api/me"), ("get", "/api/stamps"), ("get", "/api/records"), ("post", "/api/records"),
         ("get", "/api/records/1"), ("post", "/api/records/1/analyze"), ("get", "/api/today-word"),
-        ("get", "/api/dev/latest-analysis"), ("get", "/api/weekly"), ("post", "/api/shares/draft"),
-        ("patch", "/api/shares/1"), ("post", "/api/shares/1/send"), ("get", "/api/letters"),
+        ("get", "/api/dev/latest-analysis"), ("get", "/api/weekly"), ("post", "/api/shares"),
+        ("get", "/api/shares/preview?record_id=1"), ("get", "/api/letters"), ("delete", "/api/letters/1"),
+        ("delete", "/api/letters/1/replies/1"),
         ("post", "/api/letters/1/stamps"), ("post", "/api/letters/1/reactions"),
         ("post", "/api/letters/1/replies"), ("post", "/api/family/link"),
         ("delete", "/api/family/links/x"), ("post", "/api/auth/logout"),
@@ -1886,15 +2010,18 @@ class TestAuth(Base):
         a = hanako.post(f"/api/records/{rec['id']}/analyze").json()
         self.assertIn("朝の紅茶", a["todays_word"])
         self.assertEqual(hanako.get("/api/today-word").json()["todays_word"], a["todays_word"])
-        # 共有（下書き→編集→送信）
-        s = hanako.post("/api/shares/draft", json={"record_id": rec["id"]}).json()
-        self.assertEqual(s["to_name"], "たろう")
+        # 共有（プレビュー→宛先を選んで、コメントを添えて送信）
+        p = hanako.get(f"/api/shares/preview?record_id={rec['id']}").json()
+        self.assertEqual([x["display_name"] for x in p["recipients"]], ["たろう"])
         self.assertEqual(taro.get("/api/letters").json()["received"], [])  # 送るまで届かない
-        hanako.patch(f"/api/shares/{s['id']}", json={"final_text": "紅茶がおいしかったよ"})
-        self.assertEqual(hanako.post(f"/api/shares/{s['id']}/send", json={}).json()["status"], "sent")
+        r = hanako.post("/api/shares", json={"record_id": rec["id"], "to_users": [p["recipients"][0]["id"]],
+                                             "comment": "紅茶がおいしかったよ"})
+        s = r.json()["letters"][0]
+        self.assertEqual((s["status"], s["to_name"]), ("sent", "たろう"))
         # スタンプ
         received = taro.get("/api/letters").json()["received"]
-        self.assertEqual(received[0]["final_text"], "紅茶がおいしかったよ")
+        self.assertEqual(received[0]["comment"], "紅茶がおいしかったよ")
+        self.assertEqual(received[0]["feedback"]["todays_word"], a["todays_word"])
         self.assertEqual(taro.post(f"/api/letters/{s['id']}/stamps", json={"stamp": "うれしい"}).status_code, 200)
         sent = hanako.get("/api/letters").json()["sent"]
         self.assertEqual(sent[0]["stamps"][0]["from_name"], "たろう")
@@ -1984,8 +2111,10 @@ class TestOwnership(Base):
         self.assertEqual(self.d.get(f"/api/records/{rec['id']}").status_code, 403)
         self.assertEqual(self.d.post(f"/api/records/{rec['id']}/analyze").status_code, 403)
         self.c.post(f"/api/records/{rec['id']}/analyze")
-        # 他人の記録を共有の下書きに使えない
-        self.assertEqual(self.d.post("/api/shares/draft", json={"record_id": rec["id"]}).status_code, 403)
+        # 他人の記録は共有画面で開けず、便りにもできない
+        self.assertEqual(self.d.get(f"/api/shares/preview?record_id={rec['id']}").status_code, 403)
+        self.assertEqual(self.d.post("/api/shares", json={"record_id": rec["id"],
+                                                          "to_users": [self.ids["mother"]]}).status_code, 403)
         # 一覧・今日の一言・仕組みを見る・週のカウントは自分の分だけ
         self.assertEqual(self.d.get("/api/records").json(), [])
         self.assertFalse(self.d.get("/api/today-word").json()["has_record"])
@@ -2034,9 +2163,12 @@ class TestLegacyMigration(Base):
         legacy = SQLiteStore(os.path.join(self.dir, "legacy.db"))
         rec = legacy.create_record({"user_id": "mother", "date": "2026-11-20", "gratitude": "旧版の記録", "mood": "元気"})
         legacy.create_record({"user_id": "daughter", "date": "2026-11-20", "gratitude": "娘の旧記録", "mood": "ふつう"})
-        share = legacy.create_share({"from_user": "mother", "to_user": "daughter", "record_id": rec["id"],
-                                     "draft_text": "旧版の便り"})
-        legacy.update_share(share["id"], {"status": "sent", "sent_at": "2026-11-20T12:00:00+00:00"})
+        import sqlite3
+        with sqlite3.connect(legacy.db_path) as c:
+            share = {"id": c.execute(
+                "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at, sent_at)"
+                " VALUES ('mother', 'daughter', ?, '旧版の便り', '旧版の便り', 'sent',"
+                " '2026-11-20T00:00:00+00:00', '2026-11-20T12:00:00+00:00')", (rec["id"],)).lastrowid}
         self.assertTrue(auth.migrate_legacy_users(legacy))
         self.assertFalse(auth.migrate_legacy_users(legacy))  # 2回目は何もしない
         main.store = self.store = legacy

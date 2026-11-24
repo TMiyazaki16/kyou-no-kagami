@@ -102,8 +102,9 @@ class TestMySQLOffline(unittest.TestCase):
             st.save_analysis({"record_id": 1, "user_id": "u1", "date": "2026-11-22", "engine": "mock",
                               "baseline_day": 1})
             st.analysis_for_record(1)
-            st.create_share({"from_user": "u1", "to_user": "u2", "draft_text": "d"})
-            st.get_share(1); st.update_share(1, {"final_text": "f", "status": "sent", "sent_at": "x"})
+            st.create_letters("u1", 1, ["u2", "u3"], {"snapshot_json": "{}", "comment": "c", "photo_path": None})
+            st.create_letters("u1", 1, ["u2"], {"snapshot_json": "{}", "sent_at": "2026-11-22T20:00:00+09:00"})
+            st.sent_recipients("u1", 1); st.get_share(1)
             st.add_stamp(1, "u2", "ありがとう"); st.list_stamps(1)
             st.toggle_stamp(1, "u2", "いいね")
             st.add_reply(1, "u2", "返信"); st.list_replies(1)
@@ -185,21 +186,30 @@ class TestMySQLLive(unittest.TestCase):
         self.assertEqual(st.latest_analysis("u1")["id"], v["id"])
         self.assertEqual(st.analysis_for_record(r2["id"])["notice"], "案内")
 
-        s = st.create_share({"from_user": "u1", "to_user": "u2", "record_id": r2["id"], "draft_text": "下書き"})
-        self.assertEqual((s["status"], s["final_text"], s["sent_at"]), ("draft", "下書き", None))
-        self.assertEqual(st.list_letters_for("u2"), [])
-        st.update_share(s["id"], {"final_text": "編集した便り", "to_user": "u3"})
-        st.update_share(s["id"], {"status": "sent", "sent_at": "2026-11-22T20:00:00+09:00"})
+        # 便り（#35）：宛先ごとに1通。同じ記録・同じ相手への2回目は、1通も作らずに AlreadySentError
+        snap = '{"date": "2026-11-22", "todays_word": "「眠い」と書いた今日", "observations": ["観察"]}'
+        self.assertEqual(st.sent_recipients("u1", r2["id"]), [])
+        s, s3 = st.create_letters("u1", r2["id"], ["u2", "u3"], {"snapshot_json": snap, "comment": "コメント🌹",
+                                                                "photo_path": "/x.png",
+                                                                "sent_at": "2026-11-22T20:00:00+09:00"})
+        self.assertEqual((s["status"], s["to_user"], s3["to_user"], s["comment"], s["snapshot_json"], s["sent_at"]),
+                         ("sent", "u2", "u3", "コメント🌹", snap, "2026-11-22T20:00:00+09:00"))
+        self.assertEqual(st.get_share(s["id"])["photo_path"], "/x.png")
+        self.assertEqual(sorted(st.sent_recipients("u1", r2["id"])), ["u2", "u3"])
+        with self.assertRaises(storage.AlreadySentError) as cm:
+            st.create_letters("u1", r2["id"], ["u4", "u2"], {"snapshot_json": snap, "comment": ""})
+        self.assertEqual(cm.exception.to_users, ["u2"])
+        self.assertEqual(sorted(st.sent_recipients("u1", r2["id"])), ["u2", "u3"])   # u4 にも作らない
+        self.assertTrue(st.delete_share(s3["id"]))
+        self.assertEqual(st.sent_recipients("u1", r2["id"]), ["u2"])   # 取り消した便りは数えない
         stamp = st.add_stamp(s["id"], "u2", "電話するね")
         self.assertTrue(st.toggle_stamp(s["id"], "u2", "いいね"))
         self.assertFalse(st.toggle_stamp(s["id"], "u2", "いいね"))
-        st.update_share(s["id"], {"photo_path": "/x.png"})
-        self.assertEqual(st.get_share(s["id"])["photo_path"], "/x.png")
         rp = st.add_reply(s["id"], "u2", "見に行くね🌹")
         st.add_reply(s["id"], "u2", "二通目")
         letters = st.list_letters_for("u2")
         self.assertEqual(len(letters), 1)
-        self.assertEqual((letters[0]["to_user"], letters[0]["final_text"]), ("u2", "編集した便り"))
+        self.assertEqual((letters[0]["to_user"], letters[0]["comment"]), ("u2", "コメント🌹"))
         self.assertEqual([x["id"] for x in letters[0]["stamps"]], [stamp["id"]])
         self.assertEqual([x["body"] for x in letters[0]["replies"]], ["見に行くね🌹", "二通目"])
         self.assertEqual(letters[0]["replies"][0]["id"], rp["id"])
@@ -211,7 +221,7 @@ class TestMySQLLive(unittest.TestCase):
         self.assertFalse(st.delete_reply(rp["id"]))
         self.assertIsNone(st.get_reply(rp["id"]))
         self.assertEqual([x["body"] for x in st.list_replies(s["id"])], ["二通目"])
-        other = st.create_share({"from_user": "u1", "to_user": "u2", "draft_text": "別の下書き"})
+        other = st.create_letters("u1", r1["id"], ["u2"], {"snapshot_json": snap, "comment": ""})[0]
         st.add_reply(other["id"], "u2", "残る返信")
         self.assertTrue(st.delete_share(s["id"]))
         self.assertFalse(st.delete_share(s["id"]))

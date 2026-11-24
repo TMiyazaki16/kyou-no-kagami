@@ -23,7 +23,10 @@ function what(n: DiaryNotice): JSX.Element {
 function about(n: DiaryNotice): string {
   const sent = n.letter.sent_at ? new Date(n.letter.sent_at) : null;
   const date = sent ? `${sent.getMonth() + 1}月${sent.getDate()}日の便り` : "便り";
-  return `${date}「${excerpt(n.letter.final_text, 18)}」`;
+  // 便りの冒頭：コメント（なければ引用した今日の一言、旧版の便りは本文）
+  const l = n.letter;
+  const head = l.feedback ? l.comment || l.feedback.todays_word : l.final_text;
+  return `${date}「${excerpt(head, 18)}」`;
 }
 
 export function NotificationPanel({

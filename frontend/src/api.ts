@@ -60,12 +60,24 @@ export type TodayWordResponse =
   | (Analysis & { has_record: true })
   | { todays_word: null; kind: null; date: string; has_record: boolean; record_id: number | null };
 
+/** 便りに入る、その日の AI フィードバックの引用（送信時点のスナップショット。だれも編集できない） */
+export interface Feedback {
+  date: string;
+  todays_word: string;
+  observations: string[];
+}
+
+/** 便り（送信済み）。中身は feedback（引用）＋ comment（本人のコメント） */
 export interface Share {
   id: number;
   from_user: string;
   to_user: string;
   record_id: number | null;
-  draft_text: string;
+  /** 引用のスナップショット。旧版（#35 より前）の便りは null で、本文は final_text */
+  feedback: Feedback | null;
+  /** 本人のコメント（空のこともある） */
+  comment: string;
+  /** 旧版の便りの本文（新しい便りではコメントと同じ） */
   final_text: string;
   status: string;
   created_at: string;
@@ -74,13 +86,31 @@ export interface Share {
   to_name: string;
   /** 本人が「写真も一緒に届ける」をオンにして送った便りだけ。それ以外は null */
   photo_url?: string | null;
-  /** 書いた本人向けの応答（下書き・送信）だけ：もとの記録の写真（トグルの表示用） */
-  record_photo_url?: string | null;
   /** リアクション（旧スタンプを含む）。人×種類ごとに1つ */
   stamps?: Stamp[];
   /** テキスト返信（古い順） */
   replies?: Reply[];
 }
+
+/** 共有画面を開いた家族（連携中の相手）。already_sent はこの日の便りを送信済みか（取り消した便りは数えない） */
+export interface ShareRecipient extends FamilyMember {
+  already_sent: boolean;
+}
+
+/** 共有画面：選んだ日のフィードバックの引用と、届けられる家族 */
+export interface SharePreview {
+  record_id: number;
+  date: string;
+  /** null のときは送れない（理由は unavailable） */
+  feedback: Feedback | null;
+  unavailable: string;
+  /** 記録に写真があるときだけ（「写真も一緒に届ける」の表示用） */
+  record_photo_url: string | null;
+  recipients: ShareRecipient[];
+}
+
+/** コメントの上限（サーバーの COMMENT_MAX_CHARS と同じ。文字は code point で数える） */
+export const COMMENT_MAX_CHARS = 200;
 
 export interface Reply {
   id: number;
@@ -198,14 +228,16 @@ export const api = {
   todayWord: () => get<TodayWordResponse>("/api/today-word"),
   weekly: () => get<Weekly>("/api/weekly"),
   devLatest: () => get<DevLatest>("/api/dev/latest-analysis"),
-  createDraft: (toUser?: string, recordId?: number) =>
-    send<Share>("/api/shares/draft", { to_user: toUser ?? null, record_id: recordId ?? null }),
-  editShare: (shareId: number, finalText: string) =>
-    send<Share>(`/api/shares/${shareId}`, { final_text: finalText }, "PATCH"),
-  sendShare: (shareId: number, finalText: string, includePhoto = false) =>
-    send<Share>(`/api/shares/${shareId}/send`, { final_text: finalText, include_photo: includePhoto }),
-  /** 自分の下書き（送っていないもの）を保存せずに破棄する */
-  discardDraft: (shareId: number) => del<{ ok: boolean; deleted: number }>(`/api/shares/${shareId}`),
+  /** 共有画面：その日（自分の記録）のフィードバックの引用と、宛先ごとの送信済みかどうか */
+  sharePreview: (recordId: number) => get<SharePreview>(`/api/shares/preview?record_id=${recordId}`),
+  /** 選んだ家族それぞれに1通ずつ届ける（同じ日・同じ相手は1回だけ。送信済みがいれば 409 でだれにも送らない） */
+  sendLetters: (recordId: number, toUsers: string[], comment: string, includePhoto = false) =>
+    send<{ letters: Share[] }>("/api/shares", {
+      record_id: recordId,
+      to_users: toUsers,
+      comment,
+      include_photo: includePhoto,
+    }),
   letters: () => get<Letters>("/api/letters"),
   /** 旧版のスタンプ返信（付けるだけ）。画面はリアクション（toggleReaction）を使う */
   addStamp: (shareId: number, stamp: string) => send<Stamp>(`/api/letters/${shareId}/stamps`, { stamp }),

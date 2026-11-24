@@ -3,6 +3,7 @@ import { api, Letters as LettersData, REPLY_MAX_CHARS, Reply, Share, Stamp } fro
 import { charCount, errText, localDateTimeStr } from "../lib/format";
 import { markDiarySeen } from "../lib/diarySeen";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { FeedbackQuote } from "../components/FeedbackQuote";
 import type { Ctx } from "../navigation";
 
 const LIKE = "いいね";
@@ -269,7 +270,15 @@ export function Letters({
                   </p>
                 </header>
 
-                <p className="letter-body">{l.final_text}</p>
+                {/* 便り＝その日の鏡のことばの引用＋本人のコメント。旧版の便りは本文（final_text）だけ */}
+                {l.feedback ? (
+                  <>
+                    {l.comment && <p className="letter-body letter-comment">{l.comment}</p>}
+                    <FeedbackQuote feedback={l.feedback} />
+                  </>
+                ) : (
+                  <p className="letter-body">{l.final_text}</p>
+                )}
                 {l.photo_url && (
                   <img
                     className="letter-photo"
@@ -418,7 +427,7 @@ export function Letters({
       </ol>
       <p className="muted">※ 家族のあいだで記録の回数を比べる表示は、このアプリにはありません。</p>
 
-      {/* 投稿：タブバーの上に浮かぶ。押しても送られず、「家族への共有」で本人が読んで直してから送る */}
+      {/* 投稿：タブバーの上に浮かぶ。押しても送られず、「家族への共有」で本人が日を選び、コメントを添えて送る */}
       <button className="primary fab" onClick={() => go("share")}>
         <PenIcon />
         <span>投稿する</span>

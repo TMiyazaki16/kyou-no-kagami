@@ -230,6 +230,26 @@ h3 {
   padding: var(--space-3) var(--space-4); line-height: var(--lh);
 }
 
+/* 鏡のことばの引用（共有画面・家族の日記の便り）：読み取り専用。淡い水色の地に藍鼠の縁 */
+.feedback-quote {
+  margin: 0 0 var(--space-3); padding: var(--space-3) var(--space-4);
+  background: var(--mizu); color: var(--ink); border-left: 6px solid var(--indigo); border-radius: var(--radius-s);
+}
+.feedback-quote-label { color: var(--deep); font-weight: 700; font-size: var(--fs-small); margin-bottom: var(--space-1); }
+.feedback-quote blockquote { margin: 0; }
+.feedback-quote-word { margin: 0; font-family: var(--serif); line-height: var(--lh); }
+.feedback-quote-obs { margin: var(--space-2) 0 0; padding-left: 1.2em; font-size: var(--fs-small); line-height: 1.6; }
+.feedback-quote-obs > li + li { margin-top: var(--space-1); }
+.share-quote-note { margin: var(--space-4) 0 var(--space-2); }
+.letter-comment { font-weight: 700; }
+
+/* 宛先のチェック（家族への共有）。送信済みの人はチェック済み・押せない */
+.recipients { border: 0; padding: 0; margin: var(--space-5) 0 0; min-width: 0; }
+.recipients legend { padding: 0; }
+.recipients .toggle-label.is-sent { color: var(--muted); cursor: default; }
+.sent-mark { font-weight: 400; font-size: var(--fs-small); }
+.recipients .muted { margin: var(--space-1) 0 0; }
+
 /* 状態の文字（赤は使わない。エラーは灯りの地で目に留まるようにする） */
 .ok { color: var(--ai); font-weight: 700; }
 .error {

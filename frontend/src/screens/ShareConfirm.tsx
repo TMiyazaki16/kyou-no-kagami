@@ -1,10 +1,8 @@
-import { useEffect, useState } from "react";
-import { api, RecordItem, Share } from "../api";
-import { errText, localDateStr } from "../lib/format";
-import { ConfirmDialog } from "../components/ConfirmDialog";
+import { useCallback, useEffect, useState } from "react";
+import { api, COMMENT_MAX_CHARS, RecordItem, SharePreview } from "../api";
+import { charCount, errText, localDateStr } from "../lib/format";
+import { FeedbackQuote } from "../components/FeedbackQuote";
 import type { Ctx } from "../navigation";
-
-const PLACEHOLDER_PREFIX = "（AI下書きはまだありません";
 
 /** 選択肢の短い説明：その日の内容が分かる程度（長い文は切る） */
 const clip = (s: string, n = 14) => {
@@ -12,7 +10,7 @@ const clip = (s: string, n = 14) => {
   return chars.length > n ? `${chars.slice(0, n).join("")}…` : chars.join("");
 };
 
-/** 記録の選択肢の表示：「11月22日（今日）　庭のバラ／元気」 */
+/** 記録の選択肢の表示：「11月22日（今日）　庭のバラ／元気」（本人だけが見る選択肢） */
 function recordLabel(r: RecordItem, today: string): string {
   const [, m, d] = r.date.split("-").map(Number);
   const day = `${m}月${d}日${r.date === today ? "（今日）" : ""}`;
@@ -22,20 +20,22 @@ function recordLabel(r: RecordItem, today: string): string {
 
 /* ------------------------------------------------------------------ */
 /* 家族への共有                                                          */
+/* 届くのは、その日の鏡のことば（今日の一言＋観察）の引用と、あなたのコメント。  */
+/* 引用は書きかえられない。回答そのもの（2問の答え・声）は届かない。          */
+/* 選んだ家族それぞれに、別々の便りとして届く。同じ日を同じ人に送るのは1回だけ。 */
 /* ------------------------------------------------------------------ */
 export function ShareConfirm({ family, go }: Ctx) {
-  const [share, setShare] = useState<Share | null>(null);
-  const [toUser, setToUser] = useState<string>(family.length === 1 ? family[0].id : "");
   // どの日の記録を共有するか。初期は今日の記録（なければ最新の記録）
   const [records, setRecords] = useState<RecordItem[] | null>(null);
   const [recordId, setRecordId] = useState<number | null>(null);
-  const [text, setText] = useState("");
+  const [preview, setPreview] = useState<SharePreview | null>(null);
+  const [toUsers, setToUsers] = useState<string[]>([]);
+  const [comment, setComment] = useState("");
   // 「写真も一緒に届ける」。既定はオフ（記録に写真があっても、本人がオンにしたときだけ届く）
   const [includePhoto, setIncludePhoto] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [confirmDiscard, setConfirmDiscard] = useState(false);
 
   const today = localDateStr();
 
@@ -50,182 +50,175 @@ export function ShareConfirm({ family, go }: Ctx) {
       .catch(() => setRecords([]));
   }, [today]);
 
-  const sent = share !== null && share.status !== "draft";
-  const sendable = text.trim() !== "" && !text.trim().startsWith(PLACEHOLDER_PREFIX);
-  const selected = records?.find((r) => r.id === recordId) ?? null;
+  /** 選んだ日の引用と宛先を読み直す。未送信の相手が1人だけなら、はじめからチェックしておく */
+  const loadPreview = useCallback(async (id: number) => {
+    const p = await api.sharePreview(id);
+    setPreview(p);
+    const open = p.recipients.filter((r) => !r.already_sent);
+    setToUsers(open.length === 1 && p.recipients.length === 1 ? [open[0].id] : []);
+    return p;
+  }, []);
 
-  const wrap = async (fn: () => Promise<void>) => {
+  useEffect(() => {
+    if (recordId === null) return;
+    setPreview(null);
+    setIncludePhoto(false);
+    setError("");
+    loadPreview(recordId).catch((e) => setError(`この日を開けませんでした: ${errText(e)}`));
+  }, [recordId, loadPreview]);
+
+  const count = charCount(comment.trim());
+  const over = count > COMMENT_MAX_CHARS;
+  const recipients = preview?.recipients ?? [];
+  const allSent = recipients.length > 0 && recipients.every((r) => r.already_sent);
+  const sendable = !!preview?.feedback && toUsers.length > 0 && !over && !busy;
+
+  const toggleTo = (id: string, on: boolean) =>
+    setToUsers((cur) => (on ? [...cur.filter((x) => x !== id), id] : cur.filter((x) => x !== id)));
+
+  const send = async () => {
+    if (!preview || recordId === null) return;
     setBusy(true);
     setError("");
+    setStatus("");
     try {
-      await fn();
+      const { letters } = await api.sendLetters(
+        recordId,
+        toUsers,
+        comment,
+        includePhoto && !!preview.record_photo_url,
+      );
+      const names = letters.map((l) => l.to_name).join("・");
+      const withPhoto = letters.some((l) => l.photo_url);
+      setStatus(
+        `✓ ${names}へ${withPhoto ? "、写真と一緒に" : ""}届けました。` +
+          (letters.length > 1 ? "それぞれに別の便りとして届いています。" : ""),
+      );
+      setComment("");
+      setIncludePhoto(false);
+      await loadPreview(recordId);
     } catch (e) {
-      setError(`うまくいきませんでした: ${errText(e)}`);
+      setError(`送れませんでした: ${errText(e)}`);
+      // 送信済みの相手が増えていた（別の端末で送ったなど）ときに表示を合わせる
+      loadPreview(recordId).catch(() => {});
     } finally {
       setBusy(false);
     }
-  };
-
-  const makeDraft = () =>
-    wrap(async () => {
-      const s = await api.createDraft(toUser || undefined, recordId ?? undefined);
-      setShare(s);
-      setText(s.final_text.startsWith(PLACEHOLDER_PREFIX) ? "" : s.final_text);
-      setIncludePhoto(false);
-      setStatus("");
-    });
-
-  const saveEdit = () =>
-    wrap(async () => {
-      if (!share) return;
-      setShare(await api.editShare(share.id, text));
-      setStatus("✓ 下書きを保存しました");
-    });
-
-  const send = () =>
-    wrap(async () => {
-      if (!share) return;
-      const s = await api.sendShare(share.id, text, includePhoto && !!share.record_photo_url);
-      setShare(s);
-      setText(s.final_text);
-      setStatus(s.photo_url ? `✓ ${s.to_name}へ、写真と一緒に届けました` : `✓ ${s.to_name}へ届けました`);
-    });
-
-  // 保存せずに破棄：サーバーの下書きを消し、下書きを作る前の状態に戻す（選んだ日・相手はそのまま）
-  // 失敗したときもダイアログは閉じる（エラーはダイアログの後ろのカードに出すため）
-  const discard = async () => {
-    await wrap(async () => {
-      if (!share) return;
-      await api.discardDraft(share.id);
-      setShare(null);
-      setText("");
-      setIncludePhoto(false);
-      setStatus("✓ 下書きを破棄しました。誰にも届いていません。");
-    });
-    setConfirmDiscard(false);
   };
 
   return (
     <section>
       <h2>家族への共有</h2>
       <p className="lead">
-        共有は任意です。AIが作った下書きを、あなたが読んで、直して、「送る」と決めた内容だけが家族に届きます。
+        共有は任意です。届くのは、その日の鏡のことば（今日の一言と観察）と、あなたが添えるコメントだけです。
+        記録の回答そのものは届きません。「送る」を押すまで、誰にも届きません。
       </p>
-      {!share && family.length === 0 && (
+      {family.length === 0 && (
         <div className="card">
           <p>まだ家族と連携していません。便りは、連携した家族にだけ送れます。</p>
           <button onClick={() => go("settings")}>設定・家族で連携する</button>
         </div>
       )}
-      {!share && family.length > 0 && (
+      {family.length > 0 && records !== null && records.length === 0 && (
         <div className="card">
-          {family.length > 1 && (
-            <>
-              <label className="q" htmlFor="to-user">送る相手</label>
-              <select id="to-user" value={toUser} onChange={(e) => setToUser(e.target.value)}>
-                <option value="">選んでください</option>
-                {family.map((f) => (
-                  <option key={f.id} value={f.id}>{f.display_name}</option>
-                ))}
-              </select>
-            </>
-          )}
-          {records !== null && records.length > 0 && (
-            <>
-              <label className="q" htmlFor="share-record">どの日の記録を届けますか</label>
-              <select
-                id="share-record"
-                value={recordId ?? ""}
-                onChange={(e) => setRecordId(Number(e.target.value))}
-                aria-describedby="share-record-detail"
-              >
-                {records.map((r) => (
-                  <option key={r.id} value={r.id}>{recordLabel(r, today)}</option>
-                ))}
-              </select>
-              {selected && (
-                <p className="muted" id="share-record-detail">
-                  {selected.todays_word
-                    ? `この日の一言：${selected.todays_word}`
-                    : "この日の一言はまだありません。下書きは、あなたが書いて送れます。"}
-                </p>
-              )}
-            </>
-          )}
-          <div className="row">
-            <button className="primary" onClick={makeDraft} disabled={busy || !toUser}>AIの下書きを作る</button>
-          </div>
-          {status && <p className="ok">{status}</p>}
-          {error && <p className="error">{error}</p>}
+          <p>まだ記録がありません。記録すると、その日の鏡のことばを家族に届けられます。</p>
+          <button onClick={() => go("record")}>記録する</button>
         </div>
       )}
-      {share && (
+      {family.length > 0 && records !== null && records.length > 0 && (
         <div className="card">
-          <p className="muted">AIの下書き（そのまま送る必要はありません）:</p>
-          <p className="draft">{share.draft_text}</p>
-          <label className="q">{sent ? "送った内容" : "送る内容（自由に直せます）"}</label>
-          <textarea
-            rows={4}
-            value={text}
-            readOnly={sent}
-            placeholder="家族に届けたいことを、ひとこと書いてください"
-            onChange={(e) => setText(e.target.value)}
-          />
-          {!sent && share.record_photo_url && (
-            <div className="photo-toggle">
-              <label className="toggle-label">
-                <input
-                  type="checkbox"
-                  checked={includePhoto}
-                  onChange={(e) => setIncludePhoto(e.target.checked)}
-                />
-                <span>写真も一緒に届ける</span>
-              </label>
-              <p className="muted">
-                {includePhoto
-                  ? "この写真も便りと一緒に届きます。"
-                  : "記録の写真は届きません（文面だけが届きます）。"}
+          <label className="q" htmlFor="share-record">どの日のことばを届けますか</label>
+          <select
+            id="share-record"
+            value={recordId ?? ""}
+            onChange={(e) => {
+              setStatus("");
+              setRecordId(Number(e.target.value));
+            }}
+            disabled={busy}
+          >
+            {records.map((r) => (
+              <option key={r.id} value={r.id}>{recordLabel(r, today)}</option>
+            ))}
+          </select>
+
+          {preview && preview.feedback && (
+            <>
+              <p className="muted share-quote-note">届くことば（書きかえはできません）</p>
+              <FeedbackQuote feedback={preview.feedback} />
+
+              <label className="q" htmlFor="share-comment">ひとこと添える（なくても送れます）</label>
+              <textarea
+                id="share-comment"
+                rows={3}
+                value={comment}
+                placeholder="たとえば「バラが咲いたよ」"
+                aria-describedby="share-comment-count"
+                onChange={(e) => setComment(e.target.value)}
+              />
+              <p id="share-comment-count" className={over ? "reply-count over" : "reply-count"}>
+                {count} / {COMMENT_MAX_CHARS}字
               </p>
-              {includePhoto && <img className="preview share-photo" src={share.record_photo_url} alt="一緒に届ける写真" />}
-            </div>
-          )}
-          {sent && share.photo_url && (
-            <img className="preview share-photo" src={share.photo_url} alt="便りと一緒に届けた写真" />
-          )}
-          {!sent && (
-            <>
+
+              <fieldset className="recipients">
+                <legend className="q">届ける家族</legend>
+                {recipients.map((r) => (
+                  <label key={r.id} className={`toggle-label${r.already_sent ? " is-sent" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={r.already_sent || toUsers.includes(r.id)}
+                      disabled={r.already_sent || busy}
+                      onChange={(e) => toggleTo(r.id, e.target.checked)}
+                    />
+                    <span>
+                      {r.display_name}
+                      {r.already_sent && <span className="sent-mark">（この日の便りは送信済み）</span>}
+                    </span>
+                  </label>
+                ))}
+                <p className="muted">
+                  {allSent
+                    ? "この日の便りは、連携している家族みんなに送ってあります。送り直すときは、家族の日記で前の便りを取り消してください。"
+                    : "選んだ人それぞれに、別々の便りとして届きます。同じ日の便りを同じ人に送れるのは1回だけです。"}
+                </p>
+              </fieldset>
+
+              {preview.record_photo_url && (
+                <div className="photo-toggle">
+                  <label className="toggle-label">
+                    <input
+                      type="checkbox"
+                      checked={includePhoto}
+                      onChange={(e) => setIncludePhoto(e.target.checked)}
+                    />
+                    <span>写真も一緒に届ける</span>
+                  </label>
+                  <p className="muted">
+                    {includePhoto
+                      ? "この写真も便りと一緒に届きます。"
+                      : "記録の写真は届きません（ことばとコメントだけが届きます）。"}
+                  </p>
+                  {includePhoto && (
+                    <img className="preview share-photo" src={preview.record_photo_url} alt="一緒に届ける写真" />
+                  )}
+                </div>
+              )}
+
               <div className="row">
-                <button onClick={saveEdit} disabled={busy}>下書きを保存</button>
-                <button className="primary" onClick={send} disabled={busy || !sendable}>
-                  {share.to_name}へ送る
+                <button className="primary" onClick={send} disabled={!sendable}>
+                  {toUsers.length > 1 ? `選んだ${toUsers.length}人に送る` : "送る"}
                 </button>
               </div>
-              <div className="row">
-                <button className="text-btn" onClick={() => setConfirmDiscard(true)} disabled={busy}>
-                  保存せずに破棄する
-                </button>
-              </div>
+              <p className="muted">
+                送った便りは書きかえられません。取り消すと、家族の画面からも消えます（取り消しは「家族の日記」から）。
+              </p>
             </>
           )}
-          {sent && (
-            <p className="muted">
-              送った便りは書きかえることはできません。取り消すと、家族の画面からも消えます（取り消しは「家族の日記」から）。
-            </p>
-          )}
+          {preview && !preview.feedback && <p className="notice">{preview.unavailable}</p>}
           {status && <p className="ok">{status}</p>}
           {error && <p className="error">{error}</p>}
         </div>
       )}
-      <ConfirmDialog
-        open={confirmDiscard}
-        title="この下書きを破棄しますか？"
-        confirmLabel="破棄する"
-        busy={busy}
-        onConfirm={discard}
-        onCancel={() => setConfirmDiscard(false)}
-      >
-        <p>下書きは、まだ誰にも届いていません。破棄すると、書いた内容は残りません。</p>
-      </ConfirmDialog>
     </section>
   );
 }
