@@ -33,6 +33,12 @@ Gemini の出力はそのまま使わず、後段ガード（`guard_gemini`）�
 （表情の明るさ・姿勢・部屋の明るさ等）だけで、言葉・声と並ぶ材料の一つとして添える。外見へのコメントは (g) で止める。
 写真を受け付けない恒常的エラー（400 等）のときは、写真を外して同じモデルで続行する（写真は任意なので音声より先に外す）。
 モックは写真の中身を見ないので、写真が届いたことにだけ触れる。
+
+観察候補（#23）：観察の「候補出し」は Gemini、「採用」はサーバー。Gemini は observation_candidates
+（各 {text, quote, date}、最大 MAX_CANDIDATES 件）を提案し、`evaluate_candidates` が候補ごとに検査する：
+引用の実在（quote が date の日の記録に逐語で含まれる）、NG語、外見、断定調、ベースライン中の変化への言及、
+ルール観察との重複。落ちた候補だけを捨て、今日の一言や他の候補には影響しない。採用した候補はルール観察の
+後ろに並べる。care_context（定型文の付与）はルール由来だけで決める。モックは候補を出さない。
 """
 from __future__ import annotations
 
@@ -89,7 +95,27 @@ SYSTEM_RULES = (
     "書かないこと：アドバイスや指示（「〜しましょう」「〜してみては」等）、"
     "決まり文句の励まし（「がんばりましたね」等）、気持ちの断定、良し悪しの評価、"
     "体調の断定（「疲れているようです」「疲れていますね」等）やその原因の推測。\n"
-    "長さは2〜3文、全体で120字程度まで。"
+    "長さは2〜3文、全体で120字程度まで。\n"
+    "【役割分担】あなたの役割は次の2つだけです。"
+    "①今日の一言（本人の言葉の映し返し）を文章にすること。"
+    "②観察の候補（observation_candidates）を提案すること。候補には、根拠にした本人の言葉を"
+    "逐語で（一字一句そのまま）quote に、その言葉があった記録の日付を date に必ず添えます。\n"
+    "あなたの役割ではないこと：観察を最終的に決めること（候補を採用するかどうかは、アプリが根拠の言葉を"
+    "確かめて決めます）、判定・診断・助言、受診や医療への言及。\n"
+)
+
+# 観察候補（#23）。Gemini は候補を出すだけで、採用はサーバー（evaluate_candidates）が決める
+MAX_CANDIDATES = 3
+CANDIDATE_RULES = (
+    "観察の候補（observation_candidates）について：本人が自分では気づいていないかもしれない、"
+    "言葉の選び方・言葉の中で同居しているもの・数日の流れなどの気づきを、最大3件まで提案してください。"
+    "見つからなければ空配列にします（無理に作らない）。\n"
+    "- text：本人に返す1文。本人の言葉を「」で引用して根拠を示し、言い切らずに"
+    "「〜かもしれませんね」「〜でしょうか」の推し量りまでにします。\n"
+    "- quote：根拠にした本人の言葉を、記録からそのまま抜き出したもの（言い換え・要約をしない）。\n"
+    "- date：その言葉があった記録の日付（YYYY-MM-DD）。\n"
+    "候補でも、病名・医療的な表現・受診の勧め・助言・指示・外見（体型・顔色など）へのコメント・"
+    "体調や疲れの断定（「疲れているようです」等）は書きません。\n"
 )
 
 # (a) NG語。誤検出しやすい短いひらがな（「がん」=がんばる、「うつ」=うつくしい 等）は入れない。
@@ -323,6 +349,7 @@ def analyze(
     request["trends"] = trends
 
     result: dict | None = None
+    candidates: list[str] = []  # 採用した観察候補（Gemini の一言が採用されたときだけ）
     if api_key:
         models = gemini_models()
         request["model_chain"] = models
@@ -351,6 +378,16 @@ def analyze(
             g["response"]["gemini_attempts"] = attempts
             # ガードは、どのモデルが応答しても同じものを通す
             result = _apply_guards(g, record, baseline_day, previous, trends, request["recent_days"])
+            # 観察候補（#23）。今日の一言のガードとは別の、候補だけに効く層。一言がモックに
+            # 差し替わったとき（モックは候補を出さない）は、検査結果だけ残して採用しない
+            adoptable = result["engine"] == "gemini" and result["kind"] == "word"
+            items = evaluate_candidates(
+                g.get("observation_candidates"), record=record, transcript=result.get("transcript") or "",
+                history=history or [record], recent=request["recent_days"], baseline_day=baseline_day,
+                change=change, adoptable=adoptable,
+                not_adoptable_reason="engine_fallback" if result["engine"] != "gemini" else "no_text")
+            result["response"].setdefault("guard", {})["candidates"] = items
+            candidates = [it["text"] for it in items if it["adopted"]]
     else:
         result = _analyze_mock(record, baseline_day, previous, trends)
         result["fallback_reason"] = "no_api_key"
@@ -362,7 +399,8 @@ def analyze(
             baseline_day,
         )
     else:
-        result["observations"] = list(result["observations"]) + change["observations"]
+        # ルール観察 → AI の観察候補の順。候補は定型文の付与（care_context）には関わらない
+        result["observations"] = list(result["observations"]) + change["observations"] + candidates
         # (d) 健康への配慮が必要な文脈では、定型文だけをサーバー側で付ける
         if change["care_context"] and FIXED_CARE_PHRASE not in result["observations"]:
             result["observations"].append(FIXED_CARE_PHRASE)
@@ -447,6 +485,116 @@ def recent_trends(history: list[dict], change: dict) -> list[dict]:
             n = rules._trailing(after, lambda r: rules._length(r) <= limit)
             out.append({"kind": "short_answers", "days": n})
     return out
+
+
+# --------------------------------------------------------------------------
+# 観察候補（#23）：Gemini が提案し、サーバーが候補ごとに採否を決める
+# --------------------------------------------------------------------------
+
+_RULE_QUOTED = re.compile(r"『([^』]*)』")
+_MD_DATE = re.compile(r"^(\d{1,2})[/月-](\d{1,2})日?$")
+
+
+def _candidate_date(raw: str, window: dict[str, dict]) -> str | None:
+    """候補の date を、プロンプトで見せた記録の日付（YYYY-MM-DD）に合わせる。
+    プロンプトの直近の記録は「MM/DD」で見せているので、月日だけの書き方も受け付ける。"""
+    raw = (raw or "").strip()
+    if raw in window:
+        return raw
+    m = _MD_DATE.match(raw)
+    if m:
+        md = f"-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        hits = [d for d in window if d.endswith(md)]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def evaluate_candidates(raw, *, record: dict, transcript: str, history: list[dict], recent: list[dict],
+                        baseline_day: int, change: dict, adoptable: bool = True,
+                        not_adoptable_reason: str = "engine_fallback") -> list[dict]:
+    """Gemini の観察候補を1件ずつ検査し、{text, quote, date, adopted, reason} のリストを返す。
+
+    - 引用の実在：quote（空白・句読点を除いて比べる）が、date の日の記録の感謝・気分・声のどれかに含まれる。
+      date はプロンプトで見せた日（今日と直近の記録）だけを受け付ける
+    - NG語・外見・断定調：本人の言葉（今日と直近の記録）を「」で引用した部分を除いて検査する
+    - ベースライン中：変化に触れる候補は guard_baseline_change。触れていなくても、観察文は定型文に
+      差し替える期間なので採用しない（baseline_period）
+    - 重複：ルールC が発火した監視語（同じグループの語を含む）に触れる候補、ルール観察が『』で引いた言葉と
+      同じ quote の候補は duplicate_rule。先に採用した候補と同じ文は duplicate_candidate
+    - adoptable=False（今日の一言がモックに差し替わった等）のときは、検査結果を残したうえで採用しない
+    """
+    if isinstance(raw, dict):
+        raw = [raw]
+    elif not isinstance(raw, list):
+        raw = [raw] if raw else []
+    in_baseline = baseline_day <= BASELINE_DAYS
+
+    # 根拠にしてよい記録：今日（Gemini の文字起こしを含む）と、プロンプトで見せた直近の記録の日
+    window: dict[str, dict] = {}
+    shown = {r["date"] for r in recent or []}
+    for r in rules._one_per_day(history or []):
+        if r["date"] in shown:
+            window[r["date"]] = r
+    window[record["date"]] = {**record, "transcript": transcript or record.get("transcript", "")}
+
+    def fields(r: dict) -> list[str]:
+        return [t for t in (r.get("gratitude"), r.get("mood"), r.get("transcript")) if (t or "").strip()]
+
+    quoted_ok = [t for r in window.values() for t in fields(r)]
+
+    fired_words = [f[len("word:"):] for f in change.get("fired", []) if f.startswith("word:")]
+    dup_words = sorted({w for f in fired_words for w in rules.WATCH_WORDS if w[:1] == f[:1]} | set(fired_words))
+    rule_quotes = {_STRIP.sub("", q) for o in change.get("observations", []) for q in _RULE_QUOTED.findall(o)}
+    rule_quotes.discard("")
+
+    items: list[dict] = []
+    adopted_texts: set[str] = set()
+    for i, c in enumerate(raw):
+        if not isinstance(c, dict):
+            items.append({"text": str(c)[:200], "quote": "", "date": "", "adopted": False, "reason": "invalid"})
+            continue
+        text = str(c.get("text") or "").strip()
+        quote = str(c.get("quote") or "").strip()
+        raw_date = str(c.get("date") or "").strip()
+        item = {"text": text, "quote": quote, "date": raw_date, "adopted": False, "reason": ""}
+        items.append(item)
+        if not text or not quote:
+            item["reason"] = "invalid"
+            continue
+        if i >= MAX_CANDIDATES:
+            item["reason"] = "over_limit"
+            continue
+        d = _candidate_date(raw_date, window)
+        q = _STRIP.sub("", quote)
+        if d:
+            item["date"] = d
+        if not d or len(q) < QUOTE_MIN_LEN or not any(q in _STRIP.sub("", t) for t in fields(window[d])):
+            item["reason"] = "quote_not_found"
+            continue
+        own = strip_user_quotes(text, quoted_ok)
+        if find_ng_words(own):
+            item["reason"], item["hits"] = "guard_ng_word", find_ng_words(own)
+        elif find_appearance_words(own):
+            item["reason"], item["hits"] = "guard_appearance", find_appearance_words(own)
+        elif find_assertive_state(own):
+            item["reason"], item["hits"] = "guard_assertive", find_assertive_state(own)
+        elif in_baseline and [w for w in BASELINE_CHANGE_WORDS if w in own]:
+            item["reason"] = "guard_baseline_change"
+            item["hits"] = [w for w in BASELINE_CHANGE_WORDS if w in own]
+        elif in_baseline:
+            item["reason"] = "baseline_period"
+        elif [w for w in dup_words if w in text or w in quote] or q in rule_quotes:
+            item["reason"] = "duplicate_rule"
+            item["hits"] = [w for w in dup_words if w in text or w in quote] or [quote]
+        elif _STRIP.sub("", text) in adopted_texts:
+            item["reason"] = "duplicate_candidate"
+        elif not adoptable:
+            item["reason"] = not_adoptable_reason
+        else:
+            item["adopted"] = True
+            adopted_texts.add(_STRIP.sub("", text))
+    return items
 
 
 def _redact(text: str, secret: str) -> str:
@@ -736,6 +884,7 @@ def _gemini_prompt(request: dict, with_audio: bool, with_photo: bool = False) ->
     inputs = request["inputs"]
     baseline_note = (
         f"現在はベースライン学習期間（{request['baseline_day']}日目）です。変化への言及はしないでください。"
+        "観察の候補（observation_candidates）は空配列にしてください。"
         if request["baseline_period"]
         else "変化に触れる場合も、判断ではなく観察としてだけ書いてください。"
     )
@@ -746,13 +895,15 @@ def _gemini_prompt(request: dict, with_audio: bool, with_photo: bool = False) ->
         if with_audio else ""
     )
     return (
-        f"{SYSTEM_RULES}\n{baseline_note}\n{audio_note}{PHOTO_RULES if with_photo else ''}{_recent_block(request)}"
+        f"{SYSTEM_RULES}\n{CANDIDATE_RULES}{baseline_note}\n{audio_note}{PHOTO_RULES if with_photo else ''}{_recent_block(request)}"
         f"質問: ①今日、感謝できることは？ ②今日の気分・体調を一言で言うと？\n"
-        f"今日のメモ:\n- 感謝できること: {inputs['gratitude']}\n- 気分・体調: {inputs['mood']}\n"
+        f"今日のメモ{'（' + request['date'] + '）' if request.get('date') else ''}:\n- 感謝できること: {inputs['gratitude']}\n- 気分・体調: {inputs['mood']}\n"
         "体調についての助言・受診の勧め・病名は書かないでください（必要な定型文はアプリ側で付けます）。\n"
         "出力はJSONのみ: {\"transcript\": \"音声の文字起こし（音声が無ければ空文字）\", "
         "\"todays_word\": \"本人の言葉を「」で具体的に引用し、その裏の気持ちを映し返す2〜3文の一言\", "
-        "\"observations\": [\"観察の箇条書き\"]}"
+        "\"observations\": [\"観察の箇条書き\"], "
+        "\"observation_candidates\": [{\"text\": \"本人に返す観察の候補（1文）\", "
+        "\"quote\": \"根拠にした本人の言葉（記録から逐語で）\", \"date\": \"その言葉があった記録の日付 YYYY-MM-DD\"}]}"
     )
 
 
@@ -778,6 +929,8 @@ def _recent_block(request: dict) -> str:
     block = f"{TREND_RULES}\n"
     if lines:
         block += f"直近の記録（過去{RECENT_CONTEXT_DAYS}日、古い順。今日は含まない）:\n" + "\n".join(lines) + "\n"
+        block += ("観察の候補の根拠に直近の記録の言葉を使うときは、date にその日付を"
+                  f"YYYY-MM-DD で書いてください（年は {rows[0]['date'][:4]} 年）。\n")
     block += ("アプリが言葉の一致だけで数えた傾向の手がかり:\n" + "\n".join(hints) + "\n" if hints
               else "アプリが数えた傾向の手がかり: なし（はっきりした傾向がなければ、過去には触れない）\n")
     return block
@@ -894,6 +1047,7 @@ def _analyze_gemini(api_key: str, request: dict, record: dict, audio: tuple[byte
     return {
         "todays_word": parsed.get("todays_word", ""),
         "observations": parsed.get("observations", []) or [],
+        "observation_candidates": parsed.get("observation_candidates") or [],
         "transcript": (parsed.get("transcript") or "") if use_audio else "",
         "response": response,
     }
