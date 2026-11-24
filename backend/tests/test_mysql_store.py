@@ -227,7 +227,8 @@ class TestMySQLLive(unittest.TestCase):
         self.assertFalse(st.delete_share(s["id"]))
         self.assertIsNone(st.get_share(s["id"]))
         self.assertEqual((st.list_stamps(s["id"]), st.list_replies(s["id"])), ([], []))
-        self.assertEqual(st.list_letters_for("u2"), [])
+        # 取り消した便りだけが消え、別の日の便り（other）は残る
+        self.assertEqual([x["id"] for x in st.list_letters_for("u2")], [other["id"]])
         self.assertEqual([x["body"] for x in st.list_replies(other["id"])], ["残る返信"])
 
         self.assertTrue(st.remove_family_link("u1", "u2"))
