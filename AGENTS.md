@@ -234,7 +234,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
 | 検証スキル | `verify-app` |
 | テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
-| テストの期待値 | `Ran 131 tests` / `OK (skipped=1)`（2026-11-24 時点。skip は MySQL 実機検査）。テストを足したら更新する |
+| テストの期待値 | `Ran 138 tests` / `OK (skipped=1)`（2026-11-24 時点。skip は MySQL 実機検査）。テストを足したら更新する |
 | ビルド | `cd frontend && npm run build` |
 | 画面確認用 Python | `playwright` が入った Python（アプリの依存ではない。無ければ `verify-app` の 3-1 で別 venv を作る） |
 | 不変条件 | このファイルの「仕様の不変条件」 |
