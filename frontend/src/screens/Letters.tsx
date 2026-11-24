@@ -59,9 +59,9 @@ const Avatar = ({ name, mine }: { name: string; mine: boolean }) => (
 function ReactionList({ stamps }: { stamps: Stamp[] }) {
   if (stamps.length === 0) return null;
   return (
-    <ul className="post-reactions" aria-label="付いたリアクション">
+    <ul className="chips" aria-label="付いたリアクション">
       {stamps.map((s) => (
-        <li key={s.id} className="post-reaction">
+        <li key={s.id} className="chip">
           {s.stamp === LIKE && <span aria-hidden="true">♥ </span>}
           {s.from_name}「{s.stamp}」
         </li>
@@ -162,12 +162,12 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
   return (
     <section>
       <h2>家族の日記</h2>
-      <p className="muted diary-lead">あなたと家族が「送る」と決めた便りだけが、ここに並びます。</p>
+      <p className="lead">あなたと家族が「送る」と決めた便りだけが、ここに並びます。</p>
       {posts !== null && posts.length === 0 && (
         <p className="muted">まだ便りはありません。送りたいときは「共有の確認」からどうぞ。</p>
       )}
 
-      <ol className="diary-feed">
+      <ol className="stream">
         {(posts ?? []).map((l) => {
           const mine = l.from_user === me.id;
           const stamps = l.stamps ?? [];
@@ -179,15 +179,14 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
           const count = charCount(text.trim());
           const over = count > REPLY_MAX_CHARS;
           return (
-            <li key={l.id}>
-              <article className={`post${mine ? " mine" : " family"}`} aria-label={`${l.from_name}の便り`}>
+            <li key={l.id} className={mine ? "mine" : "family"}>
+              <article className={`card post${mine ? " mine" : " family"}`} aria-label={`${l.from_name}の便り`}>
                 <header className="post-head">
                   <Avatar name={l.from_name} mine={mine} />
                   <p className="post-meta">
                     <span className="post-name">{l.from_name}</span>
                     {mine && <span className="post-you">（あなた）</span>}
                     <span className="post-to"> → {mine ? l.to_name : "あなた"}</span>
-                    <br />
                     <span className="post-date">{sentLabel(l)}</span>
                   </p>
                 </header>

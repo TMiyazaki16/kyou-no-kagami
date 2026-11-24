@@ -1,6 +1,7 @@
 import { FormEvent, useState } from "react";
 import { api, Me } from "../api";
 import { errText } from "../lib/format";
+import { WaterBand } from "../components/WaterBand";
 
 /* ------------------------------------------------------------------ */
 /* ログイン / 登録（未ログイン時）                                       */
@@ -35,11 +36,12 @@ export function AuthScreen({ onAuthed }: { onAuthed: (token: string, user: Me) =
   return (
     <main className="main">
       <section>
-        <h2>{mode === "login" ? "ログイン" : "アカウントをつくる"}</h2>
+        <WaterBand title={mode === "login" ? "ログイン" : "アカウントをつくる"} />
+        <p className="lead">毎日のわたしを映す鏡。届けたい日は、家族にも。</p>
         <p className="lead">
           記録はまず、あなた自身のためのものです。家族に届くのは、あなたが「送る」と決めたものだけです。
         </p>
-        <div className="row">
+        <div className="seg">
           <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>ログイン</button>
           <button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>
             はじめての方（登録）

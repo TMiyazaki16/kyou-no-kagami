@@ -82,17 +82,28 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [meId, screen]);
 
-  if (checking) return <div className="app"><p>読み込み中…</p></div>;
+  // 深い藍の細いヘッダー（画面の幅いっぱい。中身は本文の列にそろえる）
+  const appbar = (right?: JSX.Element) => (
+    <header className="appbar">
+      <div className="appbar-in">
+        <h1 className="brand">きょうのかがみ</h1>
+        {right}
+      </div>
+    </header>
+  );
+
+  if (checking)
+    return (
+      <div className="app">
+        {appbar()}
+        <main className="main"><p>読み込み中…</p></main>
+      </div>
+    );
 
   if (!me) {
     return (
       <div className="app">
-        <header className="header">
-          <div>
-            <h1>きょうのかがみ</h1>
-            <p className="tagline">毎日のわたしを映す鏡。届けたい日は、家族にも。</p>
-          </div>
-        </header>
+        {appbar()}
         <AuthScreen onAuthed={onAuthed} />
       </div>
     );
@@ -106,14 +117,13 @@ export default function App() {
 
   return (
     <div className="app app-authed">
-      <header className="header header-bar">
-        <h1>きょうのかがみ</h1>
-        <div className="user-switch">
+      {appbar(
+        <>
           <DiaryBell count={newReactions} onOpen={() => go("letters")} />
           <span className="who">{me.display_name}</span>
           <button onClick={logout}>ログアウト</button>
-        </div>
-      </header>
+        </>,
+      )}
 
       {/* H-5: アカウントが変わったら画面の状態を作り直す */}
       <main className="main" key={me.id}>
@@ -129,7 +139,7 @@ export default function App() {
         {screen === "disclaimer" && <Disclaimer />}
       </main>
 
-      {/* 案B: 主要画面は下部タブ、残りは「その他」シート（画面の数・名前は NAV のまま） */}
+      {/* 主要画面は下部タブ、残りは「その他」シート（画面の数・名前は NAV のまま） */}
       <BottomTabs screen={screen} go={go} />
     </div>
   );

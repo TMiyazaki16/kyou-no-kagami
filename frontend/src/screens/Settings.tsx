@@ -82,10 +82,10 @@ export function Settings({ me, family, refreshMe }: Ctx) {
         {family.length === 0 ? (
           <p className="muted">まだいません。</p>
         ) : (
-          <ul>
+          <ul className="member-list">
             {family.map((f) => (
               <li key={f.id}>
-                {f.display_name}{" "}
+                <span>{f.display_name}</span>
                 <button onClick={() => unlink(f)} disabled={busy}>連携を解除</button>
               </li>
             ))}
