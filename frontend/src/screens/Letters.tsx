@@ -41,6 +41,13 @@ const StampIcon = () => (
   </svg>
 );
 
+const PenIcon = () => (
+  <svg className="fab-icon" {...svgProps} fill="none">
+    <path d="M4 20l1-4.5L15.5 5a2.1 2.1 0 0 1 3 3L8 18.5 4 20z" />
+    <path d="M13.5 7l3 3" />
+  </svg>
+);
+
 const ReplyIcon = () => (
   <svg className="act-icon" {...svgProps} fill="none">
     <path d="M5 6h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-4 3v-3H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z" />
@@ -114,6 +121,7 @@ type Pending = { kind: "retract"; letter: Share } | { kind: "reply"; letter: Sha
 /* ------------------------------------------------------------------ */
 export function Letters({
   me,
+  go,
   onSeen,
   focusId,
   onFocused,
@@ -225,11 +233,11 @@ export function Letters({
   };
 
   return (
-    <section>
+    <section className="letters">
       <h2>家族の日記</h2>
       <p className="lead">あなたと家族が「送る」と決めた便りだけが、ここに並びます。</p>
       {posts !== null && posts.length === 0 && (
-        <p className="muted">まだ便りはありません。送りたいときは「共有の確認」からどうぞ。</p>
+        <p className="muted">まだ便りはありません。送りたいときは「家族への共有」からどうぞ。</p>
       )}
 
       <ol className="stream">
@@ -409,6 +417,12 @@ export function Letters({
         })}
       </ol>
       <p className="muted">※ 家族のあいだで記録の回数を比べる表示は、このアプリにはありません。</p>
+
+      {/* 投稿：タブバーの上に浮かぶ。押しても送られず、「家族への共有」で本人が読んで直してから送る */}
+      <button className="primary fab" onClick={() => go("share")}>
+        <PenIcon />
+        <span>投稿する</span>
+      </button>
 
       <ConfirmDialog
         open={pending !== null}

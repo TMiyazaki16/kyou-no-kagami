@@ -18,7 +18,7 @@ export const NAV: { id: Screen; label: string }[] = [
   { id: "today", label: "今日の一言" },
   { id: "list", label: "記録一覧" },
   { id: "reflect", label: "振り返り" },
-  { id: "share", label: "共有の確認" },
+  { id: "share", label: "家族への共有" },
   { id: "letters", label: "家族の日記" },
   { id: "dev", label: "仕組みを見る" },
   { id: "settings", label: "設定・家族" },
@@ -35,7 +35,7 @@ export interface Ctx {
 
 /**
  * 下部タブに出す主要画面（案B）。並びと文言は NAV のものを使う。
- * ここにない画面（今日の一言・記録一覧・共有の確認・設定・家族・仕組みを見る・免責表示）は
+ * ここにない画面（今日の一言・記録一覧・家族への共有・設定・家族・仕組みを見る・免責表示）は
  * タブの「その他」から開くシートに、NAV の並びのまま出す。画面の数・名前・意味は変えない。
  */
 export const TAB_IDS: Screen[] = ["home", "record", "reflect", "letters"];

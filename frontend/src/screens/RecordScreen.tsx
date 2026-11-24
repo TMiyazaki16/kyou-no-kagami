@@ -13,6 +13,8 @@ export function RecordScreen({ go }: Ctx) {
   const [photo, setPhoto] = useState<File | null>(null);
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [discarded, setDiscarded] = useState(false);
   const [recording, setRecording] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -40,8 +42,20 @@ export function RecordScreen({ go }: Ctx) {
     if (photoUrl) URL.revokeObjectURL(photoUrl);
   }, [photoUrl]);
 
+  // 録音を保存前に聞くための URL。録り直し・破棄・画面離脱で古い URL を破棄する
+  useEffect(() => {
+    if (!audioBlob) {
+      setAudioUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(audioBlob);
+    setAudioUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [audioBlob]);
+
   const startRec = async () => {
     setError("");
+    setDiscarded(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const preferred = pickRecorderMime();
@@ -64,6 +78,12 @@ export function RecordScreen({ go }: Ctx) {
   const stopRec = () => {
     recorderRef.current?.stop();
     setRecording(false);
+  };
+
+  // 未保存の録音をやめる。保存済みの声には触れない（保存しても音声は送らない）
+  const discardRec = () => {
+    setAudioBlob(null);
+    setDiscarded(true);
   };
 
   const runAnalyze = async (recordId: number) => {
@@ -117,7 +137,7 @@ export function RecordScreen({ go }: Ctx) {
       <h2>今日の記録</h2>
       <div className="notice">🔒 この記録は、まだ誰にも届いていません</div>
       <p className="muted">
-        共有は、あなたが「共有の確認」で内容を見て、送ると決めたときだけ行われます。
+        共有は、あなたが「家族への共有」で内容を見て、送ると決めたときだけ行われます。
       </p>
       {existing && (
         <p className="muted">
@@ -148,8 +168,32 @@ export function RecordScreen({ go }: Ctx) {
             <span className="rec-label">{recording ? "⏹ 録音をとめる" : "🎙 録音をはじめる"}</span>
           </button>
         </div>
-        {audioBlob && !recording && <p className="ok">✓ 音声が用意できました</p>}
-        {!audioBlob && existing?.audio_url && <p className="muted">今日の声の記録は保存済みです。</p>}
+        {/* 録音中はプレイヤーを出さない（再生した音をマイクが拾わないように） */}
+        {!recording && audioUrl && (
+          <>
+            <p className="ok">✓ 新しい録音ができました。保存する前に聞いて確かめられます。</p>
+            {existing?.audio_url && (
+              <p className="muted">保存すると、今日の声はこの新しい録音に差しかわります。</p>
+            )}
+            <audio controls src={audioUrl} aria-label="新しい録音" />
+            <div className="row">
+              <button onClick={discardRec}>この録音をやめる</button>
+            </div>
+          </>
+        )}
+        {!recording && !audioBlob && discarded && (
+          <p className="muted">
+            {existing?.audio_url
+              ? "新しい録音をやめました。保存済みの声はそのまま残ります。"
+              : "録音をやめました。保存しても声は付きません（文字の記録になります）。"}
+          </p>
+        )}
+        {!recording && !audioBlob && existing?.audio_url && (
+          <>
+            <p className="muted">今日の声の記録は保存済みです。聞いてから、録り直すかどうか決められます。</p>
+            <audio controls src={existing.audio_url} aria-label="保存済みの声" />
+          </>
+        )}
         <p className="muted">声で答えた内容は、下の欄に文字でも書いてもらえると、AIが言葉を拾いやすくなります。</p>
       </div>
 
