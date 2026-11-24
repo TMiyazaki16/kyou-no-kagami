@@ -117,7 +117,7 @@ export function RecordScreen({ go }: Ctx) {
       <h2>今日の記録</h2>
       <div className="notice">🔒 この記録は、まだ誰にも届いていません</div>
       <p className="muted">
-        共有は、あなたが「共有の確認」で内容を見て、送ると決めたときだけ行われます。
+        共有は、あなたが「家族への共有」で内容を見て、送ると決めたときだけ行われます。
       </p>
       {existing && (
         <p className="muted">

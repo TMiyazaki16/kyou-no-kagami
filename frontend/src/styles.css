@@ -347,7 +347,8 @@ pre {
 
 /* ==================================================================
    部品：水鏡（今日の一言）
-   本文の下に水平線を引き、最後の行が上下逆さに映る（装飾。読み上げない）
+   本文の下に水平線を引き、その下に静かな水面（波線）を置く。
+   映り込み（反転した行）と文字のゆらぎは、読みづらいので置かない（#25）
    一番明るいところでも白文字 8.64:1
    ================================================================== */
 .mirror {
@@ -369,39 +370,24 @@ pre {
 }
 .mirror.large .mirror-word { font-size: var(--fs-word-large); }
 .mirror-word .quote { color: #fff; text-decoration-color: rgba(127, 178, 204, 0.7); }
-.mirror-surface { position: relative; height: 74px; margin: var(--space-3) calc(-1 * var(--mirror-pad)) 0; }
-.mirror.large .mirror-surface { height: 96px; }
+.mirror-surface { position: relative; height: 60px; margin: var(--space-3) calc(-1 * var(--mirror-pad)) 0; }
+.mirror.large .mirror-surface { height: 72px; }
 .mirror-horizon {
   position: absolute; left: 0; right: 0; top: 0; height: 1.5px;
   background: linear-gradient(90deg, rgba(127, 178, 204, 0), rgba(127, 178, 204, 0.9) 30%, rgba(220, 235, 243, 0.95) 50%, rgba(127, 178, 204, 0.9) 70%, rgba(127, 178, 204, 0));
 }
-.mirror-reflect {
-  position: absolute; left: var(--mirror-pad); right: var(--mirror-pad); top: 4px; bottom: 0; overflow: hidden;
-  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0.18) 55%, rgba(0, 0, 0, 0) 100%);
-          mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0.18) 55%, rgba(0, 0, 0, 0) 100%);
-}
-/* 本文と同じ幅・同じ組みの写しを、下端を水平線にそろえて置き、下端を軸に上下反転する
-   → 本文の最後の行が水平線のすぐ下に来る（JS で高さを測らない） */
-.mirror-reflect .mirror-word {
-  position: absolute; left: 0; right: 0; bottom: 100%;
-  transform: scaleY(-1); transform-origin: 50% 100%;
-  color: var(--ripple-soft);
-}
-.mirror-reflect .quote { color: inherit; }
 .mirror-lines { position: absolute; left: 0; bottom: 0; width: 100%; height: 28px; opacity: 0.35; }
 .mirror-drops { position: absolute; left: 50%; top: 0; width: 320px; height: 90px; transform: translate(-50%, -2px); overflow: visible; pointer-events: none; }
 .mirror-drops ellipse { fill: none; stroke: var(--ripple-soft); stroke-width: 1.4; opacity: 0; transform-box: fill-box; transform-origin: center; }
 .mirror .text-btn { position: relative; z-index: 2; margin: -30px 0 var(--space-2); color: var(--moon); }
 .mirror .text-btn:focus-visible { outline-color: var(--moon); }
 
-/* 現れる：少し下から浮かび、ゆらぎが静まる（静まったら .appear を外して SVG フィルタも外す） */
+/* 現れる：少し下から浮かぶ（文字は歪ませない）。水平線から波紋が広がる */
 .mirror.appear > .mirror-word { animation: rise 2.8s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
-.mirror.appear .mirror-reflect { animation: reflect-in 3.2s ease-out both; }
 .mirror.appear .mirror-drops ellipse { animation: ring 3.2s ease-out both; }
 .mirror.appear .mirror-drops ellipse:nth-child(2) { animation-delay: 0.45s; }
 .mirror.appear .mirror-drops ellipse:nth-child(3) { animation-delay: 0.9s; }
 @keyframes rise { 0% { opacity: 0; transform: translateY(10px); } 35% { opacity: 1; } 100% { opacity: 1; transform: none; } }
-@keyframes reflect-in { 0% { opacity: 0; } 40% { opacity: 1; } 100% { opacity: 1; } }
 @keyframes ring { 0% { opacity: 0.9; transform: scale(0.06); } 70% { opacity: 0.35; } 100% { opacity: 0; transform: scale(1); } }
 
 /* ==================================================================
@@ -568,6 +554,21 @@ dialog.confirm .row { margin-top: var(--space-5); }
    → フォーカスでレイアウトを切り替える指定は置かない。今の iOS Safari・Android Chrome は
      ソフトキーボードでレイアウトの高さを変えないので、固定のタブはキーボードの後ろに隠れる */
 
+/* ---- 家族の日記の「投稿する」：タブバーの上に浮かぶ（#25） -----------
+   位置は固定で、入力中も動かさない（上のタブバーの注意と同じ理由）。
+   シート（z-index 25）より下、本文より上。PC では本文の列の右端にそろえる */
+.fab {
+  position: fixed; z-index: 15;
+  right: max(var(--gutter), calc(50% - 320px + var(--gutter)));
+  bottom: calc(var(--tabbar-h) + var(--safe-bottom) + var(--space-4));
+  min-height: var(--btn-h); padding: 12px 24px 12px 20px;
+  border-radius: var(--radius-pill);
+  box-shadow: 0 2px 0 var(--deep), 0 6px 18px rgba(14, 44, 64, 0.28);
+}
+.fab-icon { width: 24px; height: 24px; flex: none; }
+/* 最後の便りのアクションバー・返信欄が「投稿する」に隠れないよう、ボタンの高さぶん下を空ける */
+.letters { padding-bottom: calc(var(--btn-h) + var(--space-6)); }
+
 /* ---- 「その他」シート -------------------------------------------- */
 .sheet-backdrop {
   position: fixed; inset: 0; z-index: 25;
@@ -609,7 +610,7 @@ body.sheet-open { overflow: hidden; }
 }
 
 /* ==================================================================
-   動きを減らす設定：波線・ゆらぎ・波紋は止め、静止した「水面」だけ残す
+   動きを減らす設定：波線・浮き上がり・波紋は止め、静止した「水面」だけ残す
    ================================================================== */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

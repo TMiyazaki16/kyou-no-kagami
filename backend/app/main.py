@@ -443,7 +443,7 @@ def weekly(user_id: str = Depends(_uid)):
 
 
 # --------------------------------------------------------------------------
-# Sharing （共有の確認 / 届いた便り） — opt-in only, editable draft, stamps
+# Sharing （家族への共有 / 届いた便り） — opt-in only, editable draft, stamps
 # --------------------------------------------------------------------------
 
 class DraftIn(BaseModel):

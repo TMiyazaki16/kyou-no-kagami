@@ -21,7 +21,7 @@ function recordLabel(r: RecordItem, today: string): string {
 }
 
 /* ------------------------------------------------------------------ */
-/* 共有の確認                                                          */
+/* 家族への共有                                                          */
 /* ------------------------------------------------------------------ */
 export function ShareConfirm({ family, go }: Ctx) {
   const [share, setShare] = useState<Share | null>(null);
@@ -107,7 +107,7 @@ export function ShareConfirm({ family, go }: Ctx) {
 
   return (
     <section>
-      <h2>共有の確認</h2>
+      <h2>家族への共有</h2>
       <p className="lead">
         共有は任意です。AIが作った下書きを、あなたが読んで、直して、「送る」と決めた内容だけが家族に届きます。
       </p>
