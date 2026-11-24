@@ -9,6 +9,10 @@ const FALLBACK_TEXT: Record<string, string> = {
     "GEMINI_API_KEY が未設定のため、ローカルモックで生成しました（本人の言葉を引用する決定的な生成です）。",
   gemini_error:
     "Gemini API の呼び出しでエラーが起きたため、ローカルモックに切り替えました（エラー内容はレスポンスの gemini_error に出ています）。",
+  quota_user:
+    "このアカウントの、今日の Gemini の利用回数の上限に達したため、Gemini を呼ばずにローカルモックで生成しました（上限はレスポンスの quota に出ています）。",
+  quota_global:
+    "今日の Gemini の利用回数の上限（全体）に達したため、Gemini を呼ばずにローカルモックで生成しました（上限はレスポンスの quota に出ています）。",
   guard_ng_word:
     "Gemini の出力に病名・医療的な助言にあたる語が含まれていたため破棄し、ローカルモックに差し替えました。",
   guard_no_quote:
@@ -64,6 +68,7 @@ export function DevView() {
     ? `Gemini API（${String((ana.request as { model?: string }).model ?? dev?.gemini_model)}）で生成し、サーバー側のガード（NG語・引用チェック）を通過しました。`
     : FALLBACK_TEXT[ana.fallback_reason] ?? "ローカルモックで生成しました。";
   const photoLine = photoText(ana.response.photo as PhotoStatus | undefined);
+  const reused = ana.response.reused as { from_analysis_id?: number } | undefined;
 
   return (
     <section>
@@ -74,6 +79,11 @@ export function DevView() {
           <span className={isGemini ? "badge gemini" : "badge mock"}>{ana.engine}</span>
         </p>
         <p className="muted">{explanation}</p>
+        {reused && (
+          <p className="muted">
+            記録の内容が前回の解析と同じだったため、Gemini を呼ばずに前回の解析結果（#{reused.from_analysis_id}）を再利用しました。
+          </p>
+        )}
         {photoLine && <p className="muted">{photoLine}</p>}
         {ana.kind === "voice_notice" && (
           <p className="muted">文字の入力も文字起こしもなかったため、汎用文は出さずに案内文を返しました。</p>

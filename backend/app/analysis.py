@@ -39,6 +39,10 @@ Gemini の出力はそのまま使わず、後段ガード（`guard_gemini`）�
 引用の実在（quote が date の日の記録に逐語で含まれる）、NG語、外見、断定調、ベースライン中の変化への言及、
 ルール観察との重複。落ちた候補だけを捨て、今日の一言や他の候補には影響しない。採用した候補はルール観察の
 後ろに並べる。care_context（定型文の付与）はルール由来だけで決める。モックは候補を出さない。
+
+回数ガード（#34）：呼び出し元（main.run_analysis）が `quota` を渡すと、実 Gemini を呼ぶ直前に1回だけ呼ぶ。
+枠が取れなければ（dict が返れば）Gemini を呼ばずにモックに落とす（fallback_reason = "quota_user" / "quota_global"）。
+フォールバック連鎖・再試行は、1回の解析でまとめて1回と数える（枠の確保はモデルのループの外で1回）。
 """
 from __future__ import annotations
 
@@ -52,6 +56,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import date
+from typing import Callable
 
 from . import rules
 
@@ -318,11 +323,13 @@ def analyze(
     history: list[dict] | None = None,
     audio: tuple[bytes, str] | None = None,
     photo: tuple[bytes, str] | None = None,
+    quota: Callable[[], dict | None] | None = None,
 ) -> dict:
     """Returns {todays_word, kind, notice, observations, engine, fallback_reason,
     transcript, request, response}.
 
-    audio / photo は (中身, MIME)。中身はリクエストのログ（request）には残さない。"""
+    audio / photo は (中身, MIME)。中身はリクエストのログ（request）には残さない。
+    quota は実 Gemini を呼ぶ直前に1回だけ呼ぶ（枠が取れたら None、超えていたら {"scope": "user" | "global", ...}）。"""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     in_baseline = baseline_day <= BASELINE_DAYS
     request = {
@@ -350,7 +357,14 @@ def analyze(
 
     result: dict | None = None
     candidates: list[str] = []  # 採用した観察候補（Gemini の一言が採用されたときだけ）
-    if api_key:
+    # 回数ガード（#34）。数えるのは実 Gemini を呼ぶ直前の1回だけ（連鎖・再試行はまとめて1回）
+    quota_denied = quota() if api_key and quota else None
+    if quota_denied:
+        result = _analyze_mock(record, baseline_day, previous, trends)
+        result["engine"] = "mock (quota fallback)"
+        result["fallback_reason"] = f"quota_{quota_denied['scope']}"
+        result["response"]["quota"] = quota_denied
+    elif api_key:
         models = gemini_models()
         request["model_chain"] = models
         request["model"] = models[0]
