@@ -454,6 +454,20 @@ pre {
 }
 
 /* ==================================================================
+   部品：確認ダイアログ（便りの取り消し・返信の削除・下書きの破棄）
+   ネイティブの <dialog>（最前面に出るのでタブバーより上）。赤・警告色は使わない
+   ================================================================== */
+dialog.confirm {
+  width: min(560px, calc(100% - 2 * var(--gutter))); max-height: calc(100dvh - 2 * var(--gutter));
+  border: 1px solid var(--line); border-radius: var(--radius-l);
+  padding: var(--space-6) var(--gutter) var(--gutter);
+  background: var(--card); color: var(--ink); box-shadow: var(--shadow-lift);
+}
+dialog.confirm::backdrop { background: rgba(14, 44, 64, 0.4); }
+dialog.confirm h3 { margin: 0 0 var(--space-3); }
+dialog.confirm .row { margin-top: var(--space-5); }
+
+/* ==================================================================
    家族の日記：便り（自分＝白、家族＝灯り）
    ================================================================== */
 .post { padding: var(--space-4) 14px; }

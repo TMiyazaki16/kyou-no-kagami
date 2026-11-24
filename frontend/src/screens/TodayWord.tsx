@@ -63,7 +63,16 @@ export function TodayWord({ go }: Ctx) {
         </div>
       ) : (
         /* 開いたとき、水面に映るように現れる（動きを減らす設定では静止） */
-        <MirrorWord text={ana.todays_word ?? ""} large appear />
+        <>
+          <MirrorWord text={ana.todays_word ?? ""} large appear />
+          {/* 共有は任意。押しても送られず、共有の確認で本人が読んで直してから送る */}
+          {ana.todays_word && (
+            <div className="card">
+              <button className="primary big-btn" onClick={() => go("share")}>この一言を家族に届ける</button>
+              <p className="muted">共有の確認で、内容を読んで直してから送れます。送るまで、誰にも届きません。</p>
+            </div>
+          )}
+        </>
       )}
       <div className="card">
         <h3>AIが観察したこと</h3>
