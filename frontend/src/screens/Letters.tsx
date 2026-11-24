@@ -119,7 +119,18 @@ type Pending = { kind: "retract"; letter: Share } | { kind: "reply"; letter: Sha
 /* 家族から届いた便り：♡いいね・定型スタンプ・返信ができる                    */
 /* 自分の便り：家族が付けたリアクションと返信をその下に表示（既読は出さない）   */
 /* ------------------------------------------------------------------ */
-export function Letters({ me, go, onSeen }: Ctx & { onSeen?: () => void }) {
+export function Letters({
+  me,
+  go,
+  onSeen,
+  focusId,
+  onFocused,
+}: Ctx & {
+  onSeen?: () => void;
+  /** 通知パネルの行から開いたとき：その便りまでスクロールして、しばらく強調する */
+  focusId?: number | null;
+  onFocused?: () => void;
+}) {
   const [posts, setPosts] = useState<Share[] | null>(null);
   const [stampOptions, setStampOptions] = useState<string[]>([]);
   const [openPanel, setOpenPanel] = useState<Record<number, "stamps" | "reply" | undefined>>({});
@@ -128,6 +139,23 @@ export function Letters({ me, go, onSeen }: Ctx & { onSeen?: () => void }) {
   const [errors, setErrors] = useState<Record<number, string>>({});
   const replyRefs = useRef<Record<number, HTMLTextAreaElement | null>>({});
   const [pending, setPending] = useState<Pending | null>(null);
+  const [highlight, setHighlight] = useState<number | null>(null);
+
+  // 通知から来たとき：便りが読み込めたら該当の投稿を画面の中ほどへ寄せ、フォーカスして数秒だけ縁取る
+  useEffect(() => {
+    if (focusId == null || posts === null) return;
+    onFocused?.();
+    const el = document.getElementById(`post-${focusId}`);
+    if (!el) return; // 取り消された便りなど：家族の日記の先頭のまま
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.focus({ preventScroll: true });
+    setHighlight(focusId);
+  }, [focusId, posts, onFocused]);
+  useEffect(() => {
+    if (highlight === null) return;
+    const t = window.setTimeout(() => setHighlight(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [highlight]);
 
   const load = useCallback(() => {
     api
@@ -225,7 +253,12 @@ export function Letters({ me, go, onSeen }: Ctx & { onSeen?: () => void }) {
           const over = count > REPLY_MAX_CHARS;
           return (
             <li key={l.id} className={mine ? "mine" : "family"}>
-              <article className={`card post${mine ? " mine" : " family"}`} aria-label={`${l.from_name}の便り`}>
+              <article
+                id={`post-${l.id}`}
+                tabIndex={-1}
+                className={`card post${mine ? " mine" : " family"}${highlight === l.id ? " post-focus" : ""}`}
+                aria-label={`${l.from_name}の便り`}
+              >
                 <header className="post-head">
                   <Avatar name={l.from_name} mine={mine} />
                   <p className="post-meta">

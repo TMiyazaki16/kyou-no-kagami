@@ -44,9 +44,9 @@ frontend/src/
   App.tsx             外枠のみ（ログイン確認・ヘッダー・ナビ・画面の切替）。画面の中身は書かない
   navigation.ts       Screen（画面ID）・NAV（ナビの並びと文言）・Ctx（各画面に渡す共通 props）
   screens/            1画面1ファイル（全10画面＋ログイン/登録 AuthScreen）。ファイル名＝コンポーネント名
-  components/         2画面以上・外枠で使う部品（WeeklyMessage・WeekCard、BottomTabs、DiaryBell＝ヘッダーの通知ベル、水面の部品：WaterBand＝帯・MirrorWord＝今日の一言の水鏡・WaveLines、ConfirmDialog＝取り消し・破棄の確認）
+  components/         2画面以上・外枠で使う部品（WeeklyMessage・WeekCard、BottomTabs、DiaryBell＝ヘッダーの通知ベル・NotificationPanel＝ベルから開く反応の一覧、水面の部品：WaterBand＝帯・MirrorWord＝今日の一言の水鏡・WaveLines、ConfirmDialog＝取り消し・破棄の確認）
   styles.css          デザイン「水面」（#19）。色・寸法は :root の CSS 変数、部品は共通クラス（.card・button.primary・.notice・.band・.mirror・.stream・.rings・.tab・.fab＝家族の日記の「投稿する」）。画面ごとの場当たりの色・寸法を足さない。入力中にタブ・保存ボタンの位置を切り替えない（クリックが届かなくなる）
-  lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText、audio.ts：録音形式、diarySeen.ts：通知バッジの既読時刻を localStorage に置く）
+  lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText・relativeTimeStr・excerpt、audio.ts：録音形式、diarySeen.ts：通知バッジの既読時刻を localStorage に置く・通知パネルの一覧を組み立てる）
   api.ts              API クライアントと型。トークンを localStorage に置き Authorization ヘッダーで送る
 ```
 
