@@ -13,12 +13,17 @@ import { Letters } from "./screens/Letters";
 import { DevView } from "./screens/DevView";
 import { Settings } from "./screens/Settings";
 import { Disclaimer } from "./screens/Disclaimer";
+import { DiaryBell } from "./components/DiaryBell";
+import { countNewReactions } from "./lib/diarySeen";
 
 export default function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [family, setFamily] = useState<FamilyMember[]>([]);
   const [checking, setChecking] = useState(session.get() !== null);
   const [screen, setScreen] = useState<Screen>("home");
+  // 通知バッジ：自分の投稿に付いた新しい反応の数（既読はこの端末の localStorage だけ）
+  const [newReactions, setNewReactions] = useState(0);
+  const clearBadge = useCallback(() => setNewReactions(0), []);
 
   const refreshMe = useCallback(async () => {
     const res = await api.me();
@@ -60,7 +65,22 @@ export default function App() {
     setMe(null);
     setFamily([]);
     setScreen("home");
+    setNewReactions(0);
   };
+
+  // 画面を切り替えたとき・1分ごとにバッジを数え直す（「家族の日記」を開いている間は Letters が既読にする）
+  const meId = me?.id;
+  useEffect(() => {
+    if (!meId || screen === "letters") return;
+    const refresh = () =>
+      api
+        .letters()
+        .then((d) => setNewReactions(countNewReactions(d.sent, meId)))
+        .catch(() => {});
+    refresh();
+    const timer = window.setInterval(refresh, 60_000);
+    return () => window.clearInterval(timer);
+  }, [meId, screen]);
 
   if (checking) return <div className="app"><p>読み込み中…</p></div>;
 
@@ -89,6 +109,7 @@ export default function App() {
       <header className="header header-bar">
         <h1>きょうのかがみ</h1>
         <div className="user-switch">
+          <DiaryBell count={newReactions} onOpen={() => go("letters")} />
           <span className="who">{me.display_name}</span>
           <button onClick={logout}>ログアウト</button>
         </div>
@@ -102,7 +123,7 @@ export default function App() {
         {screen === "list" && <RecordList />}
         {screen === "reflect" && <Reflect />}
         {screen === "share" && <ShareConfirm {...ctx} />}
-        {screen === "letters" && <Letters />}
+        {screen === "letters" && <Letters {...ctx} onSeen={clearBadge} />}
         {screen === "dev" && <DevView />}
         {screen === "settings" && <Settings {...ctx} />}
         {screen === "disclaimer" && <Disclaimer />}

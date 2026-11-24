@@ -19,7 +19,7 @@ export const NAV: { id: Screen; label: string }[] = [
   { id: "list", label: "記録一覧" },
   { id: "reflect", label: "振り返り" },
   { id: "share", label: "共有の確認" },
-  { id: "letters", label: "届いた便り" },
+  { id: "letters", label: "家族の日記" },
   { id: "dev", label: "仕組みを見る" },
   { id: "settings", label: "設定・家族" },
   { id: "disclaimer", label: "免責表示" },
