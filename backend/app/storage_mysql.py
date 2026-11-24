@@ -479,6 +479,12 @@ class MySQLStore(Store):
             cur.execute(f"UPDATE shares SET {clause} WHERE id = %s", (*sets.values(), share_id))
         return self.get_share(share_id)
 
+    def delete_share(self, share_id: int) -> bool:
+        with self._conn() as cur:   # 1つの接続＝1トランザクションで、反応・返信ごと消す
+            cur.execute("DELETE FROM stamps WHERE share_id = %s", (share_id,))
+            cur.execute("DELETE FROM letter_replies WHERE share_id = %s", (share_id,))
+            return bool(cur.execute("DELETE FROM shares WHERE id = %s", (share_id,)))
+
     def _letters(self, column: str, user_id: str) -> list[dict]:
         assert column in ("to_user", "from_user")
         rows = self._all(f"SELECT * FROM shares WHERE {column} = %s AND status = 'sent' ORDER BY id DESC", (user_id,))
@@ -525,3 +531,10 @@ class MySQLStore(Store):
 
     def list_replies(self, share_id: int) -> list[dict]:
         return self._all("SELECT * FROM letter_replies WHERE share_id = %s ORDER BY id ASC", (share_id,))
+
+    def get_reply(self, reply_id: int) -> dict | None:
+        return self._one("SELECT * FROM letter_replies WHERE id = %s", (reply_id,))
+
+    def delete_reply(self, reply_id: int) -> bool:
+        with self._conn() as cur:
+            return bool(cur.execute("DELETE FROM letter_replies WHERE id = %s", (reply_id,)))

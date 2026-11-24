@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, FamilyMember, Me, session, UNAUTHORIZED_EVENT } from "./api";
 import { Ctx, Screen } from "./navigation";
 import { BottomTabs } from "./components/BottomTabs";
@@ -14,7 +14,8 @@ import { DevView } from "./screens/DevView";
 import { Settings } from "./screens/Settings";
 import { Disclaimer } from "./screens/Disclaimer";
 import { DiaryBell } from "./components/DiaryBell";
-import { countNewReactions } from "./lib/diarySeen";
+import { NotificationPanel } from "./components/NotificationPanel";
+import { countNewReactions, DiaryNotice, listDiaryNotices, markDiarySeen } from "./lib/diarySeen";
 
 export default function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -24,6 +25,17 @@ export default function App() {
   // 通知バッジ：自分の投稿に付いた新しい反応の数（既読はこの端末の localStorage だけ）
   const [newReactions, setNewReactions] = useState(0);
   const clearBadge = useCallback(() => setNewReactions(0), []);
+  // 通知パネル（ベルから開く）。notices が null の間は読み込み中
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [notices, setNotices] = useState<DiaryNotice[] | null>(null);
+  // 通知の行から開いた便り（家族の日記がそこまでスクロールして強調する）
+  const [focusLetter, setFocusLetter] = useState<number | null>(null);
+  const clearFocus = useCallback(() => setFocusLetter(null), []);
+  const bellWrap = useRef<HTMLSpanElement>(null);
+  const closePanel = useCallback(() => {
+    setPanelOpen(false);
+    bellWrap.current?.querySelector("button")?.focus(); // 閉じたらベルへフォーカスを戻す
+  }, []);
 
   const refreshMe = useCallback(async () => {
     const res = await api.me();
@@ -66,6 +78,7 @@ export default function App() {
     setFamily([]);
     setScreen("home");
     setNewReactions(0);
+    setPanelOpen(false);
   };
 
   // 画面を切り替えたとき・1分ごとにバッジを数え直す（「家族の日記」を開いている間は Letters が既読にする）
@@ -115,11 +128,33 @@ export default function App() {
   };
   const ctx: Ctx = { me, family, go, refreshMe };
 
+  // ベル：パネルを開いた時点で、いま見えている反応を既読にしてバッジを消す（この端末の localStorage だけ）
+  const openPanel = () => {
+    setPanelOpen(true);
+    setNotices(null);
+    const id = me.id;
+    api
+      .letters()
+      .then((d) => {
+        setNotices(listDiaryNotices(d.sent, id)); // 「新着」の印は既読にする前の状態で決める
+        markDiarySeen(d.sent, id);
+        setNewReactions(0);
+      })
+      .catch(() => setNotices([]));
+  };
+  const pickNotice = (letterId: number) => {
+    setPanelOpen(false);
+    setFocusLetter(letterId);
+    go("letters");
+  };
+
   return (
     <div className="app app-authed">
       {appbar(
         <>
-          <DiaryBell count={newReactions} onOpen={() => go("letters")} />
+          <span ref={bellWrap} className="bell-wrap">
+            <DiaryBell count={newReactions} open={panelOpen} onToggle={() => (panelOpen ? closePanel() : openPanel())} />
+          </span>
           <span className="who">{me.display_name}</span>
           <button onClick={logout}>ログアウト</button>
         </>,
@@ -133,11 +168,15 @@ export default function App() {
         {screen === "list" && <RecordList />}
         {screen === "reflect" && <Reflect />}
         {screen === "share" && <ShareConfirm {...ctx} />}
-        {screen === "letters" && <Letters {...ctx} onSeen={clearBadge} />}
+        {screen === "letters" && (
+          <Letters {...ctx} onSeen={clearBadge} focusId={focusLetter} onFocused={clearFocus} />
+        )}
         {screen === "dev" && <DevView />}
         {screen === "settings" && <Settings {...ctx} />}
         {screen === "disclaimer" && <Disclaimer />}
       </main>
+
+      {panelOpen && <NotificationPanel notices={notices} onClose={closePanel} onPick={pickNotice} />}
 
       {/* 主要画面は下部タブ、残りは「その他」シート（画面の数・名前は NAV のまま） */}
       <BottomTabs screen={screen} go={go} />

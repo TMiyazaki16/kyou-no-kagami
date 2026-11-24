@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, Letters as LettersData, REPLY_MAX_CHARS, Reply, Share, Stamp } from "../api";
 import { charCount, errText, localDateTimeStr } from "../lib/format";
 import { markDiarySeen } from "../lib/diarySeen";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { Ctx } from "../navigation";
 
 const LIKE = "いいね";
@@ -40,6 +41,13 @@ const StampIcon = () => (
   </svg>
 );
 
+const PenIcon = () => (
+  <svg className="fab-icon" {...svgProps} fill="none">
+    <path d="M4 20l1-4.5L15.5 5a2.1 2.1 0 0 1 3 3L8 18.5 4 20z" />
+    <path d="M13.5 7l3 3" />
+  </svg>
+);
+
 const ReplyIcon = () => (
   <svg className="act-icon" {...svgProps} fill="none">
     <path d="M5 6h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-4 3v-3H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z" />
@@ -70,8 +78,18 @@ function ReactionList({ stamps }: { stamps: Stamp[] }) {
   );
 }
 
-/** 返信のスレッド（古い順）。投稿の下に字下げして並べる */
-function ReplyThread({ replies }: { replies: Reply[] }) {
+/** 返信のスレッド（古い順）。投稿の下に字下げして並べる。自分の返信にだけ「削除」を出す */
+function ReplyThread({
+  replies,
+  meId,
+  busy,
+  onDelete,
+}: {
+  replies: Reply[];
+  meId: string;
+  busy: boolean;
+  onDelete: (r: Reply) => void;
+}) {
   if (replies.length === 0) return null;
   return (
     <ul className="reply-thread" aria-label="返信">
@@ -81,11 +99,19 @@ function ReplyThread({ replies }: { replies: Reply[] }) {
             <strong>{r.from_name}</strong> ・ {localDateTimeStr(new Date(r.created_at))}
           </p>
           <p className="reply-text">{r.body}</p>
+          {r.from_user === meId && (
+            <button className="text-btn" disabled={busy} onClick={() => onDelete(r)}>
+              この返信を削除
+            </button>
+          )}
         </li>
       ))}
     </ul>
   );
 }
+
+/** 確認ダイアログで確かめている操作（便りの取り消し／自分の返信の削除） */
+type Pending = { kind: "retract"; letter: Share } | { kind: "reply"; letter: Share; reply: Reply };
 
 /* ------------------------------------------------------------------ */
 /* 家族の日記                                                          */
@@ -93,7 +119,18 @@ function ReplyThread({ replies }: { replies: Reply[] }) {
 /* 家族から届いた便り：♡いいね・定型スタンプ・返信ができる                    */
 /* 自分の便り：家族が付けたリアクションと返信をその下に表示（既読は出さない）   */
 /* ------------------------------------------------------------------ */
-export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
+export function Letters({
+  me,
+  go,
+  onSeen,
+  focusId,
+  onFocused,
+}: Ctx & {
+  onSeen?: () => void;
+  /** 通知パネルの行から開いたとき：その便りまでスクロールして、しばらく強調する */
+  focusId?: number | null;
+  onFocused?: () => void;
+}) {
   const [posts, setPosts] = useState<Share[] | null>(null);
   const [stampOptions, setStampOptions] = useState<string[]>([]);
   const [openPanel, setOpenPanel] = useState<Record<number, "stamps" | "reply" | undefined>>({});
@@ -101,6 +138,24 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
   const [busy, setBusy] = useState<number | null>(null);
   const [errors, setErrors] = useState<Record<number, string>>({});
   const replyRefs = useRef<Record<number, HTMLTextAreaElement | null>>({});
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [highlight, setHighlight] = useState<number | null>(null);
+
+  // 通知から来たとき：便りが読み込めたら該当の投稿を画面の中ほどへ寄せ、フォーカスして数秒だけ縁取る
+  useEffect(() => {
+    if (focusId == null || posts === null) return;
+    onFocused?.();
+    const el = document.getElementById(`post-${focusId}`);
+    if (!el) return; // 取り消された便りなど：家族の日記の先頭のまま
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.focus({ preventScroll: true });
+    setHighlight(focusId);
+  }, [focusId, posts, onFocused]);
+  useEffect(() => {
+    if (highlight === null) return;
+    const t = window.setTimeout(() => setHighlight(null), 2600);
+    return () => window.clearTimeout(t);
+  }, [highlight]);
 
   const load = useCallback(() => {
     api
@@ -147,6 +202,24 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
       setOpenPanel((p) => ({ ...p, [shareId]: undefined }));
     });
 
+  // 確認ダイアログの「取り消す／削除する」。失敗してもダイアログは閉じ、エラーはその便りの下に出す
+  const confirmPending = async () => {
+    if (!pending) return;
+    const { letter } = pending;
+    if (pending.kind === "retract") {
+      await run(letter.id, "取り消し", async () => {
+        await api.retractLetter(letter.id);
+        setPosts((cur) => (cur ?? []).filter((l) => l.id !== letter.id));
+      });
+    } else {
+      const { reply } = pending;
+      await run(letter.id, "返信の削除", async () => {
+        replacePost((await api.deleteReply(letter.id, reply.id)).letter);
+      });
+    }
+    setPending(null);
+  };
+
   const togglePanel = (shareId: number, panel: "stamps" | "reply") => {
     const next = openPanel[shareId] === panel ? undefined : panel;
     setOpenPanel((p) => ({ ...p, [shareId]: next }));
@@ -160,11 +233,11 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
   };
 
   return (
-    <section>
+    <section className="letters">
       <h2>家族の日記</h2>
       <p className="lead">あなたと家族が「送る」と決めた便りだけが、ここに並びます。</p>
       {posts !== null && posts.length === 0 && (
-        <p className="muted">まだ便りはありません。送りたいときは「共有の確認」からどうぞ。</p>
+        <p className="muted">まだ便りはありません。送りたいときは「家族への共有」からどうぞ。</p>
       )}
 
       <ol className="stream">
@@ -180,7 +253,12 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
           const over = count > REPLY_MAX_CHARS;
           return (
             <li key={l.id} className={mine ? "mine" : "family"}>
-              <article className={`card post${mine ? " mine" : " family"}`} aria-label={`${l.from_name}の便り`}>
+              <article
+                id={`post-${l.id}`}
+                tabIndex={-1}
+                className={`card post${mine ? " mine" : " family"}${highlight === l.id ? " post-focus" : ""}`}
+                aria-label={`${l.from_name}の便り`}
+              >
                 <header className="post-head">
                   <Avatar name={l.from_name} mine={mine} />
                   <p className="post-meta">
@@ -278,7 +356,12 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
                   </>
                 )}
 
-                <ReplyThread replies={replies} />
+                <ReplyThread
+                  replies={replies}
+                  meId={me.id}
+                  busy={busy === l.id}
+                  onDelete={(r) => setPending({ kind: "reply", letter: l, reply: r })}
+                />
 
                 {!mine && panel === "reply" && (
                   <div className="reply-box" id={`reply-box-${l.id}`}>
@@ -315,6 +398,18 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
                 {mine && stamps.length === 0 && replies.length === 0 && (
                   <p className="muted post-empty">返事はまだです。</p>
                 )}
+                {/* 送った本人だけが取り消せる（受け取った便りには出さない） */}
+                {mine && (
+                  <div className="card-foot">
+                    <button
+                      className="text-btn"
+                      disabled={busy === l.id}
+                      onClick={() => setPending({ kind: "retract", letter: l })}
+                    >
+                      送信を取り消す
+                    </button>
+                  </div>
+                )}
                 {errors[l.id] && <p className="error">{errors[l.id]}</p>}
               </article>
             </li>
@@ -322,6 +417,32 @@ export function Letters({ me, onSeen }: Ctx & { onSeen?: () => void }) {
         })}
       </ol>
       <p className="muted">※ 家族のあいだで記録の回数を比べる表示は、このアプリにはありません。</p>
+
+      {/* 投稿：タブバーの上に浮かぶ。押しても送られず、「家族への共有」で本人が読んで直してから送る */}
+      <button className="primary fab" onClick={() => go("share")}>
+        <PenIcon />
+        <span>投稿する</span>
+      </button>
+
+      <ConfirmDialog
+        open={pending !== null}
+        title={pending?.kind === "retract" ? "この便りの送信を取り消しますか？" : "この返信を削除しますか？"}
+        confirmLabel={pending?.kind === "retract" ? "送信を取り消す" : "削除する"}
+        busy={pending !== null && busy === pending.letter.id}
+        onConfirm={confirmPending}
+        onCancel={() => setPending(null)}
+      >
+        {pending?.kind === "retract" ? (
+          <>
+            <p>取り消すと、{pending.letter.to_name}の画面からも、この便りが消えます。</p>
+            <p>付いたリアクションと返信も、一緒に消えます。元には戻せません。</p>
+          </>
+        ) : (
+          <p>
+            {pending?.kind === "reply" ? `${pending.letter.from_name}の画面からも消えます。` : ""}元には戻せません。
+          </p>
+        )}
+      </ConfirmDialog>
     </section>
   );
 }

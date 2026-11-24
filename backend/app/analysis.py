@@ -392,6 +392,20 @@ def analyze(
         result = _analyze_mock(record, baseline_day, previous, trends)
         result["fallback_reason"] = "no_api_key"
 
+    # 当日のルールを文字起こし込みで再評価する（#24）。文字起こしは Gemini の結果でしか得られないので、
+    # プロンプトに渡した change_rules / trends は呼び出し前の評価のまま。当日の観察と (d) の判定にだけ効かせる。
+    # 記録に文字起こしが既にあるとき（main.py は上書きしない）は、最初の評価に含まれているので何もしない
+    new_transcript = (result.get("transcript") or "").strip()
+    if new_transcript and not (record.get("transcript") or "").strip():
+        before = change
+        change = rules.evaluate(_with_transcript(history or [record], record, new_transcript))
+        result["response"]["rules_reevaluation"] = {
+            "applied": True,
+            "reason": "transcript",
+            "before": {"fired": before["fired"], "care_context": before["care_context"]},
+            "after": {"fired": change["fired"], "care_context": change["care_context"]},
+        }
+
     # (c) ベースライン期間中は observations をサーバー定型文に差し替え（どのエンジンでも）
     if in_baseline:
         result["observations"] = baseline_observations(
@@ -415,6 +429,11 @@ def analyze(
         "observations": result["observations"],
     }
     return result
+
+
+def _with_transcript(history: list[dict], record: dict, transcript: str) -> list[dict]:
+    """履歴のうち対象日の記録に、Gemini の文字起こしを入れたもの（main.py が保存する値と同じ）。"""
+    return [{**r, "transcript": transcript} if r["date"] == record["date"] else r for r in history]
 
 
 def photo_status(result: dict, readable: bool) -> dict:

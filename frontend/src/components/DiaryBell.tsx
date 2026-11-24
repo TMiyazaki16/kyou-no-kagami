@@ -1,13 +1,21 @@
 /* ------------------------------------------------------------------ */
 /* ヘッダー右上のベル：自分の投稿に付いた新しいリアクション＋返信の数        */
-/* タップで「家族の日記」を開く（開くと Letters が既読にしてバッジが消える）  */
+/* タップで通知パネル（NotificationPanel）を開く。開くとバッジが消える       */
 /* 既読はこの端末だけ。家族に「見たかどうか」は伝わらない                    */
 /* 数の丸は赤にしない（淡い水色の丸に深い藍の数字。styles.css）              */
 /* ------------------------------------------------------------------ */
-export function DiaryBell({ count, onOpen }: { count: number; onOpen: () => void }) {
-  const label = count > 0 ? `家族の日記：あなたの便りに新しい反応が${count}件` : "家族の日記を開く";
+export function DiaryBell({ count, open, onToggle }: { count: number; open: boolean; onToggle: () => void }) {
+  const label = count > 0 ? `通知：あなたの便りに新しい反応が${count}件` : "通知を開く";
   return (
-    <button className="diary-bell" aria-label={label} title={label} onClick={onOpen}>
+    <button
+      className={`diary-bell${open ? " open" : ""}`}
+      aria-label={label}
+      title={label}
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-controls={open ? "notice-panel" : undefined}
+      onClick={onToggle}
+    >
       <svg
         viewBox="0 0 24 24"
         aria-hidden="true"

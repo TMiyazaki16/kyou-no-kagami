@@ -177,6 +177,8 @@ const send = <T>(url: string, body: unknown, method = "POST") =>
     body: JSON.stringify(body),
   }).then((r) => json<T>(r));
 
+const del = <T>(url: string) => authFetch(url, { method: "DELETE" }).then((r) => json<T>(r));
+
 export const api = {
   register: (displayName: string, email: string, password: string) =>
     send<AuthResponse>("/api/auth/register", { display_name: displayName, email, password }),
@@ -185,10 +187,7 @@ export const api = {
   me: () => get<MeResponse>("/api/me"),
   linkFamily: (code: string) =>
     send<{ linked: FamilyMember; already_linked: boolean; family: FamilyMember[] }>("/api/family/link", { code }),
-  unlinkFamily: (otherId: string) =>
-    authFetch(`/api/family/links/${encodeURIComponent(otherId)}`, { method: "DELETE" }).then((r) =>
-      json<{ family: FamilyMember[] }>(r),
-    ),
+  unlinkFamily: (otherId: string) => del<{ family: FamilyMember[] }>(`/api/family/links/${encodeURIComponent(otherId)}`),
 
   stamps: () => get<string[]>("/api/stamps"),
   records: () => get<RecordItem[]>("/api/records"),
@@ -205,6 +204,8 @@ export const api = {
     send<Share>(`/api/shares/${shareId}`, { final_text: finalText }, "PATCH"),
   sendShare: (shareId: number, finalText: string, includePhoto = false) =>
     send<Share>(`/api/shares/${shareId}/send`, { final_text: finalText, include_photo: includePhoto }),
+  /** 自分の下書き（送っていないもの）を保存せずに破棄する */
+  discardDraft: (shareId: number) => del<{ ok: boolean; deleted: number }>(`/api/shares/${shareId}`),
   letters: () => get<Letters>("/api/letters"),
   /** 旧版のスタンプ返信（付けるだけ）。画面はリアクション（toggleReaction）を使う */
   addStamp: (shareId: number, stamp: string) => send<Stamp>(`/api/letters/${shareId}/stamps`, { stamp }),
@@ -213,4 +214,9 @@ export const api = {
     send<{ reaction: string; on: boolean; letter: Share }>(`/api/letters/${shareId}/reactions`, { reaction }),
   addReply: (shareId: number, text: string) =>
     send<{ reply: Reply; letter: Share }>(`/api/letters/${shareId}/replies`, { text }),
+  /** 送信の取り消し（送った本人だけ）。家族の画面からも消え、リアクション・返信も一緒に消える */
+  retractLetter: (shareId: number) => del<{ ok: boolean; deleted: number }>(`/api/letters/${shareId}`),
+  /** 自分の返信の削除 */
+  deleteReply: (shareId: number, replyId: number) =>
+    del<{ ok: boolean; deleted: number; letter: Share }>(`/api/letters/${shareId}/replies/${replyId}`),
 };

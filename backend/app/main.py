@@ -443,7 +443,7 @@ def weekly(user_id: str = Depends(_uid)):
 
 
 # --------------------------------------------------------------------------
-# Sharing （共有の確認 / 届いた便り） — opt-in only, editable draft, stamps
+# Sharing （家族への共有 / 届いた便り） — opt-in only, editable draft, stamps
 # --------------------------------------------------------------------------
 
 class DraftIn(BaseModel):
@@ -540,26 +540,58 @@ def _is_sendable(text: str) -> bool:
     return bool(t) and t != PLACEHOLDER_DRAFT and not t.startswith("（AI下書きはまだありません")
 
 
+def _draft_label(rec_date: str | None) -> str:
+    """下書きの見出し。今日の記録は「今日の一言」、それ以外の日は「11月20日の一言」。"""
+    if not rec_date or rec_date == today_jst().isoformat():
+        return "今日の一言"
+    try:
+        d = date.fromisoformat(rec_date)
+    except ValueError:
+        return "今日の一言"
+    return f"{d.month}月{d.day}日の一言"
+
+
 @app.post("/api/shares/draft")
 def create_draft(body: DraftIn, user_id: str = Depends(_uid)):
+    """record_id を指定すると、その日（自分の記録）の一言から下書きを作る。省略時は最新の解析から。"""
     ana = None
+    rec = None
     if body.record_id:
         rec = store.get_record(body.record_id)
-        if rec and rec["user_id"] != user_id:
+        if not rec:
+            raise HTTPException(404, "record not found")
+        if rec["user_id"] != user_id:
             raise HTTPException(403, "自分の記録だけを共有できます")
-        ana = store.analysis_for_record(body.record_id)
+        # 選んだ記録に一言が無い（または上書き後でまだ作っていない）ときも、別の日の一言には差し替えない
+        ana = _current_analysis(rec)
     to_user = _pick_recipient(user_id, body.to_user)
-    if ana is None:
+    if rec is None:
         ana = store.latest_analysis(user_id)
     word = ana["todays_word"] if ana else None
-    draft = f"今日の一言：{word}" if word else PLACEHOLDER_DRAFT
+    rec_date = rec["date"] if rec else (ana["date"] if ana else None)
+    draft = f"{_draft_label(rec_date)}：{word}" if word else PLACEHOLDER_DRAFT
     share = store.create_share({
         "from_user": user_id,
         "to_user": to_user,
-        "record_id": ana["record_id"] if ana else None,  # L-8: 実際に使った解析の記録IDに揃える
+        # L-8: 実際に使った解析の記録IDに揃える（記録を選んだときはその記録）
+        "record_id": rec["id"] if rec else (ana["record_id"] if ana else None),
         "draft_text": draft,
     })
     return _with_record_photo(share, user_id)
+
+
+@app.delete("/api/shares/{share_id}")
+def discard_draft(share_id: int, user_id: str = Depends(_uid)):
+    """自分の下書き（送っていないもの）を保存せずに破棄する。送信済みの便りはここでは消せない。"""
+    share = store.get_share(share_id)
+    if not share:
+        raise HTTPException(404, "share not found")
+    if share["from_user"] != user_id:
+        raise HTTPException(403, "この下書きを破棄できるのは、書いた本人だけです")
+    if share["status"] != "draft":
+        raise HTTPException(409, "送信済みの便りは、ここでは消せません。家族の日記から取り消してください")
+    store.delete_share(share_id)
+    return {"ok": True, "deleted": share_id}
 
 
 @app.patch("/api/shares/{share_id}")
@@ -649,3 +681,35 @@ def add_reply(share_id: int, body: ReplyIn, user_id: str = Depends(_uid)):
         raise HTTPException(400, f"返信は{REPLY_MAX_CHARS}字までです（いま{len(text)}字）")
     reply = store.add_reply(share_id, user_id, text)
     return {"reply": {**reply, "from_name": _display_name(user_id)}, "letter": _letter_view(share_id)}
+
+
+@app.delete("/api/letters/{share_id}")
+def retract_letter(share_id: int, user_id: str = Depends(_uid)):
+    """送信の取り消し：送った本人だけが、送信済みの便りを消せる。家族の画面からも消え、
+    付いたリアクション・返信も一緒に消える。連携を解除したあとでも取り消せる。"""
+    share = store.get_share(share_id)
+    if not share or share["status"] != "sent":
+        raise HTTPException(404, "letter not found")
+    if share["from_user"] != user_id:
+        raise HTTPException(403, "便りを取り消せるのは、送った本人だけです")
+    store.delete_share(share_id)
+    # 便りが写し取っていた写真は、記録・ほかの便りから参照されていなければ片付ける
+    photo = share.get("photo_path")
+    if photo:
+        in_use = {r.get("photo_path") for r in store.list_records(user_id)}
+        in_use |= {s.get("photo_path") for s in store.list_letters_sent_by(user_id)}
+        if photo not in in_use:
+            _remove_file(photo)
+    return {"ok": True, "deleted": share_id}
+
+
+@app.delete("/api/letters/{share_id}/replies/{reply_id}")
+def delete_reply(share_id: int, reply_id: int, user_id: str = Depends(_uid)):
+    """自分の返信だけを削除できる（相手の返信は消せない）。連携を解除したあとでも消せる。"""
+    reply = store.get_reply(reply_id)
+    if not reply or reply["share_id"] != share_id:
+        raise HTTPException(404, "reply not found")
+    if reply["from_user"] != user_id:
+        raise HTTPException(403, "削除できるのは、自分の返信だけです")
+    store.delete_reply(reply_id)
+    return {"ok": True, "deleted": reply_id, "letter": _letter_view(share_id)}
