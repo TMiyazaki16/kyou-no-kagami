@@ -1348,7 +1348,9 @@ class TestMirrorWord(unittest.TestCase):
         self.assertIn("変化への言及はしないでください", p)
         self.assertIn("「」で具体的にそのまま引用", p)
         # 鏡としての返し方の指示（今回足した部分）には NG 語を含めない
+        # （役割分担の節は「診断・受診はしない」と書くために NG 語を含むので除く）
         guidance = analysis.SYSTEM_RULES.split("『今日の一言』は日記の要約ではありません", 1)[1]
+        guidance = guidance.split("【役割分担】", 1)[0]
         self.assertEqual(analysis.find_ng_words(guidance), [])
 
 
@@ -1492,6 +1494,173 @@ class TestRecentTrends(Base):
             [{"kind": "word", "word": "疲れ", "days": 2}], 0))
 
 
+class TestObservationCandidates(Base):
+    """観察候補（#23）：Gemini が候補を出し、サーバーが候補ごとに採否を決める。"""
+
+    STABLE = TestRecentTrends.STABLE
+    WORD = "「孫の電話」がうれしかった今日。"
+    GOOD = {"text": "「孫の電話」が、今日の気持ちを支えていたのかもしれませんね。", "quote": "孫の電話"}
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+
+    def seed_trend(self):
+        """1〜7日目は安定、8日目（昨日）に「眠い」。今日（9日目）も「眠い」なら、ことば・短さの2ルールが発火する。"""
+        self.seed_days("mother", [self.STABLE] * 7 + [("天気", "元気。でも眠い")],
+                       end=self.today - timedelta(days=1))
+
+    def analyze(self, candidates, word=None, gratitude="孫の電話", mood="元気だけど眠い"):
+        call, calls = fake_gemini({"todays_word": word or self.WORD, "observations": [],
+                                   "observation_candidates": candidates})
+        rec = self.post_record(gratitude=gratitude, mood=mood).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        return a, calls[0]["parts"][0]["text"] if calls else ""
+
+    def cand(self, text, quote, date=None):
+        return {"text": text, "quote": quote, "date": date or self.today.isoformat()}
+
+    def reasons(self, a):
+        return [(c["quote"], c["reason"]) for c in a["response"]["guard"]["candidates"]]
+
+    def test_good_candidate_is_adopted_after_rule_observations(self):
+        self.seed_trend()
+        y = self.today - timedelta(days=1)
+        good2 = self.cand("昨日の「天気」と今日の「孫の電話」、外に向いた言葉が並んでいるのかもしれませんね。",
+                          "天気", f"{y.month:02d}/{y.day:02d}")  # プロンプトの MM/DD 表記も受け付ける
+        a, prompt = self.analyze([self.cand(**self.GOOD), good2])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["todays_word"], self.WORD)
+        obs = a["observations"]
+        rule_obs = [o for o in obs if "ということばが" in o or "回答がいつもより短め" in o]
+        self.assertTrue(rule_obs)
+        # 順序：ルール観察 → AI 候補 → 定型文（定型文はルールの care_context で付く）
+        i_rule = max(obs.index(o) for o in rule_obs)
+        self.assertGreater(obs.index(self.GOOD["text"]), i_rule)
+        self.assertGreater(obs.index(good2["text"]), obs.index(self.GOOD["text"]))
+        self.assertEqual(obs[-1], analysis.FIXED_CARE_PHRASE)
+        items = a["response"]["guard"]["candidates"]
+        self.assertEqual([c["adopted"] for c in items], [True, True])
+        self.assertEqual(items[1]["date"], y.isoformat())
+        self.assertEqual(a["response"]["final"]["observations"], obs)
+        # プロンプトに役割分担と出力スキーマが入る
+        self.assertIn("【役割分担】", prompt)
+        self.assertIn("あなたの役割ではないこと：観察を最終的に決めること", prompt)
+        self.assertIn('"observation_candidates"', prompt)
+        self.assertIn(analysis.CANDIDATE_RULES, prompt)
+
+    def test_quote_not_in_record_is_rejected(self):
+        self.seed_trend()
+        a, _ = self.analyze([
+            self.cand("「孫と散歩した」ことが心に残っているのかもしれませんね。", "孫と散歩した"),
+            # 実在する言葉でも、date の日の記録に無ければ落とす（昨日の言葉を今日と申告）
+            self.cand("「天気」に目が向いていたのかもしれませんね。", "天気"),
+            # 提示していない日付
+            self.cand("「孫の電話」がうれしかったのかもしれませんね。", "孫の電話", "2026-10-01"),
+            self.cand(**self.GOOD),
+        ])
+        self.assertEqual(self.reasons(a)[:3], [("孫と散歩した", "quote_not_found"), ("天気", "quote_not_found"),
+                                               ("孫の電話", "quote_not_found")])
+        self.assertNotIn("「孫と散歩した」ことが心に残っているのかもしれませんね。", a["observations"])
+        # 4件目は上限超え（最大3件）
+        self.assertEqual(self.reasons(a)[3], ("孫の電話", "over_limit"))
+        self.assertNotIn(self.GOOD["text"], a["observations"])
+
+    def test_ng_word_candidate_alone_is_dropped(self):
+        self.seed_trend()
+        bad = self.cand("「孫の電話」のあと、病院で話してみるのもいいかもしれませんね。", "孫の電話")
+        a, _ = self.analyze([bad, self.cand(**self.GOOD)])
+        self.assertEqual(self.reasons(a), [("孫の電話", "guard_ng_word"), ("孫の電話", "")])
+        self.assertEqual(a["response"]["guard"]["candidates"][0]["hits"], ["病院"])
+        self.assertNotIn(bad["text"], a["observations"])
+        # 他の候補と今日の一言は残る（一言のガードは発動しない）
+        self.assertIn(self.GOOD["text"], a["observations"])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["fallback_reason"], "")
+        self.assertEqual(a["todays_word"], self.WORD)
+
+    def test_assertive_and_appearance_candidates_are_dropped(self):
+        self.seed_trend()
+        a, _ = self.analyze([
+            self.cand("「孫の電話」のあとも、疲れているようです。", "孫の電話"),
+            self.cand("「孫の電話」の日、顔色が明るく見えます。", "孫の電話"),
+        ])
+        self.assertEqual([r for _, r in self.reasons(a)], ["guard_assertive", "guard_appearance"])
+        self.assertEqual(a["engine"], "gemini")
+        for c in a["response"]["guard"]["candidates"]:
+            self.assertNotIn(c["text"], a["observations"])
+
+    def test_baseline_rejects_candidates(self):
+        self.seed_days("mother", [self.STABLE] * 4, end=self.today - timedelta(days=1))
+        change = self.cand("最近「孫の電話」が増えているかもしれませんね。", "孫の電話")
+        a, prompt = self.analyze([change, self.cand(**self.GOOD)])
+        self.assertEqual(a["baseline_day"], 5)
+        self.assertEqual(self.reasons(a), [("孫の電話", "guard_baseline_change"), ("孫の電話", "baseline_period")])
+        self.assertTrue(any("覚えている期間" in o for o in a["observations"]))  # 定型文に差し替え
+        self.assertNotIn(change["text"], a["observations"])
+        self.assertNotIn(self.GOOD["text"], a["observations"])
+        self.assertIn("観察の候補（observation_candidates）は空配列にしてください", prompt)
+
+    def test_duplicate_of_rule_c_is_dropped(self):
+        self.seed_trend()
+        a, _ = self.analyze([
+            self.cand("「眠い」という言葉が、また出てきているのかもしれませんね。", "眠い"),
+            self.cand("昨日の「元気。でも眠い」が、今日も続いているのかもしれませんね。", "でも眠い",
+                      (self.today - timedelta(days=1)).isoformat()),
+            # ルール観察が『』で引いた言葉（元気）と同じ quote
+            self.cand("「元気」という言葉を選んでいるのかもしれませんね。", "元気"),
+            ])
+        self.assertIn("word:眠い", a["request"]["change_rules"]["fired"])
+        self.assertEqual([r for _, r in self.reasons(a)], ["duplicate_rule"] * 3)
+
+    def test_all_candidates_rejected_leaves_rule_observations(self):
+        self.seed_trend()
+        a, _ = self.analyze([
+            self.cand("「孫と散歩した」のかもしれませんね。", "孫と散歩した"),
+            self.cand("「孫の電話」のあと、薬を忘れずに。", "孫の電話"),
+        ])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(a["todays_word"], self.WORD)
+        self.assertFalse(any(c["adopted"] for c in a["response"]["guard"]["candidates"]))
+        a2, _ = self.analyze([])  # 候補なしと同じ結果になる
+        self.assertEqual(a["observations"], a2["observations"])
+        self.assertTrue(any("ということばが" in o for o in a["observations"]))
+        self.assertEqual(a["observations"][-1], analysis.FIXED_CARE_PHRASE)
+
+    def test_candidates_do_not_add_care_phrase(self):
+        self.seed_days("mother", [self.STABLE] * 8, end=self.today - timedelta(days=1))
+        a, _ = self.analyze([self.cand("「庭のバラ」の話が、また出てきたのかもしれませんね。", "庭のバラ")],
+                            word="「庭のバラ」と「元気」の今日。", gratitude="庭のバラがまた咲いた", mood="元気です")
+        self.assertEqual(a["request"]["change_rules"], {"fired": [], "care_context": False})
+        self.assertEqual(a["observations"], ["「庭のバラ」の話が、また出てきたのかもしれませんね。"])
+        self.assertNotIn(analysis.FIXED_CARE_PHRASE, a["observations"])
+
+    def test_no_candidates_when_word_falls_back_or_mock(self):
+        self.seed_trend()
+        # 一言がガードでモックに差し替わったら、候補は検査結果だけ残して採用しない
+        a, _ = self.analyze([self.cand(**self.GOOD)], word="「孫の電話」の日。受診をおすすめします。")
+        self.assertEqual(a["engine"], "mock (guard fallback)")
+        self.assertEqual(self.reasons(a), [("孫の電話", "engine_fallback")])
+        self.assertNotIn(self.GOOD["text"], a["observations"])
+        # キーなし（モック）は候補を出さない
+        os.environ.pop("GEMINI_API_KEY")
+        rec = self.store.find_record(self.ids["mother"], self.today.isoformat())
+        m = main.run_analysis(rec)
+        self.assertNotIn("candidates", m["response"].get("guard", {}))
+        self.assertFalse(any("かもしれませんね" in o and "孫の電話" in o for o in m["observations"]))
+
+    def test_malformed_candidates_do_not_break(self):
+        self.seed_trend()
+        for raw in ("文字列だけ", {"text": "「孫の電話」がうれしかったのかもしれませんね。", "quote": "孫の電話"},
+                    [None, 3, {"text": ""}], None):
+            with self.subTest(raw=raw):
+                a, _ = self.analyze(raw)
+                self.assertEqual(a["engine"], "gemini")
+                self.assertEqual(a["todays_word"], self.WORD)
+
+
+# --------------------------------------------------------------------------
 class TestRulesWithTranscript(Base):
     """当日のルール判定に、Gemini の文字起こしを反映する（#24）。"""
 
