@@ -1492,6 +1492,117 @@ class TestRecentTrends(Base):
             [{"kind": "word", "word": "疲れ", "days": 2}], 0))
 
 
+class TestRulesWithTranscript(Base):
+    """当日のルール判定に、Gemini の文字起こしを反映する（#24）。"""
+
+    STABLE = ("庭のバラがきれいに咲いて眺めていられたこと", "よく休めて体も軽く元気です")
+    AUDIO = {"audio": ("memo.ogg", b"OggS" + b"0" * 200, "audio/ogg")}
+    LONG = "今日は庭のバラがきれいに咲いていて、朝からずっと眺めていました。娘から電話もあって、ゆっくり話せました"
+    LONG_SLEEPY = "今日は庭のバラがきれいに咲いていて、朝からずっと眺めていました。元気だけど少し眠い"
+
+    def seed(self, yesterday_mood="元気"):
+        """1〜7日目は安定、8日目（昨日）は短い回答。今日（9日目）を声だけで記録する。"""
+        self.seed_days("mother", [self.STABLE] * 7 + [("天気", yesterday_mood)],
+                       end=self.today - timedelta(days=1))
+
+    def voice(self, payload, files=None, **fields):
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        call, _ = fake_gemini(payload)
+        rec = self.post_record(files=files or self.AUDIO, **fields).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            return self.c.post(f"/api/records/{rec['id']}/analyze").json()
+
+    def test_long_transcript_does_not_fire_short_answers(self):
+        self.seed()
+        a = self.voice({"transcript": self.LONG, "todays_word": "「庭のバラ」を眺めていた今日。", "observations": []})
+        self.assertEqual(a["engine"], "gemini")
+        re_ = a["response"]["rules_reevaluation"]
+        self.assertTrue(re_["applied"])
+        self.assertIn("short_answers", re_["before"]["fired"])  # 文字入力だけなら発火していた
+        self.assertNotIn("short_answers", re_["after"]["fired"])
+        self.assertFalse(any("回答がいつもより短め" in o for o in a["observations"]))
+        self.assertNotIn(analysis.FIXED_CARE_PHRASE, a["observations"])
+        # プロンプト側の文脈は呼び出し前の評価のまま
+        self.assertIn("short_answers", a["request"]["change_rules"]["fired"])
+        self.assertEqual(a["request"]["trends"], [{"kind": "short_answers", "days": 2}])
+
+    def test_watch_word_in_transcript_fires_rule_c_and_care_phrase(self):
+        self.seed(yesterday_mood="元気。でも眠い")
+        a = self.voice({"transcript": self.LONG_SLEEPY, "todays_word": "「庭のバラ」を眺めていた今日。",
+                        "observations": []})
+        re_ = a["response"]["rules_reevaluation"]
+        self.assertNotIn("word:眠い", re_["before"]["fired"])
+        self.assertFalse(re_["before"]["care_context"])
+        self.assertIn("word:眠い", re_["after"]["fired"])
+        self.assertTrue(re_["after"]["care_context"])
+        self.assertTrue(any("『眠い』ということばが、ここ2日続けて" in o for o in a["observations"]))
+        # 再評価で立った care_context により、定型文をサーバーが付ける（1回だけ）
+        self.assertEqual(a["observations"].count(analysis.FIXED_CARE_PHRASE), 1)
+
+    def test_short_transcript_still_fires_short_answers(self):
+        self.seed()
+        a = self.voice({"transcript": "まあ元気", "todays_word": "「まあ元気」の今日。", "observations": []})
+        self.assertIn("short_answers", a["response"]["rules_reevaluation"]["after"]["fired"])
+        self.assertTrue(any("回答がいつもより短め" in o for o in a["observations"]))
+
+    def test_guard_fallback_also_uses_reevaluation(self):
+        self.seed(yesterday_mood="元気。でも眠い")
+        a = self.voice({"transcript": self.LONG_SLEEPY,
+                        "todays_word": "「庭のバラ」の日。念のため病院に行ってみては。", "observations": []})
+        self.assertEqual(a["engine"], "mock (guard fallback)")
+        self.assertEqual(a["fallback_reason"], "guard_ng_word")
+        self.assertIn("word:眠い", a["response"]["rules_reevaluation"]["after"]["fired"])
+        self.assertFalse(any("回答がいつもより短め" in o for o in a["observations"]))
+        self.assertTrue(any("『眠い』ということばが" in o for o in a["observations"]))
+        self.assertIn(analysis.FIXED_CARE_PHRASE, a["observations"])
+
+    def test_no_transcript_paths_unchanged(self):
+        # キーなしモック：文字起こしは無く、ルールは文字入力だけで評価（従来どおり）
+        self.seed()
+        rec = self.post_record(files=self.AUDIO, mood="眠い").json()
+        expected = analysis.rules.evaluate(
+            [r for r in self.store.list_records(self.ids["mother"]) if r["date"] <= rec["date"]])
+        a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(a["fallback_reason"], "no_api_key")
+        self.assertNotIn("rules_reevaluation", a["response"])
+        self.assertEqual([o for o in a["observations"] if o in expected["observations"]], expected["observations"])
+        self.assertIn("short_answers", expected["fired"])
+
+        # Gemini 全滅：モックに落ち、再評価はしない
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+
+        def boom(*_a, **_k):
+            raise analysis.GeminiHTTPError(400, "bad request")
+
+        with mock.patch.object(analysis, "_call_gemini", boom):
+            b = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertEqual(b["fallback_reason"], "gemini_error")
+        self.assertNotIn("rules_reevaluation", b["response"])
+        self.assertEqual(b["observations"], a["observations"])
+
+    def test_existing_transcript_is_not_reevaluated(self):
+        # 記録に文字起こしが既にある（再解析）ときは、最初の評価に含まれているので再評価しない
+        self.seed()
+        rec = self.post_record(files=self.AUDIO).json()
+        self.store.update_record(rec["id"], {"transcript": self.LONG})
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        call, _ = fake_gemini({"transcript": "眠い", "todays_word": "「庭のバラ」の今日。", "observations": []})
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertNotIn("rules_reevaluation", a["response"])
+        self.assertNotIn("short_answers", a["request"]["change_rules"]["fired"])
+
+    def test_baseline_period_unchanged(self):
+        self.seed_days("mother", [self.STABLE] * 3, end=self.today - timedelta(days=1))
+        a = self.voice({"transcript": self.LONG_SLEEPY, "todays_word": "「庭のバラ」を眺めていた今日。",
+                        "observations": []})
+        self.assertEqual(a["baseline_day"], 4)
+        self.assertEqual(a["response"]["rules_reevaluation"]["after"], {"fired": [], "care_context": False})
+        self.assertTrue(any("覚えている期間" in o for o in a["observations"]))
+        self.assertTrue(any(o.startswith("声で話したこと：") for o in a["observations"]))
+        self.assertNotIn(analysis.FIXED_CARE_PHRASE, a["observations"])
+
+
 class TestChangeRulesAndSeed(Base):
     def test_rules_silent_during_baseline(self):
         res = self.seed_days("mother", [("", "眠い")] * 7)
