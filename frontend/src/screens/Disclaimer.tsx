@@ -6,7 +6,7 @@ export function Disclaimer() {
     <section>
       <h2>免責表示</h2>
       <div className="card">
-        <ul>
+        <ul className="rings">
           <li>このアプリは医療機器ではなく、診断や治療を行うものではありません。</li>
           <li>AIはあなたの言葉を観察として返すだけであり、判断や診断は行いません。病名の提示もしません。</li>
           <li>体調について気になることが続くときは、かかりつけの先生にも相談してみてくださいね。</li>

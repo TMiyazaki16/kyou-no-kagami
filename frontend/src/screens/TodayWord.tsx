@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Analysis, api, TodayWordResponse } from "../api";
 import { errText } from "../lib/format";
-import { QuotedText } from "../components/QuotedText";
+import { MirrorWord } from "../components/MirrorWord";
 import type { Ctx } from "../navigation";
 
 /* ------------------------------------------------------------------ */
@@ -57,25 +57,22 @@ export function TodayWord({ go }: Ctx) {
     <section>
       <h2>今日の一言</h2>
       {ana.kind === "voice_notice" ? (
-        <div className="card kagami-card word-card">
+        <div className="card">
           <p className="big">🎙 {ana.notice}</p>
           <button className="primary big-btn" onClick={() => go("record")}>文字でも一言残す</button>
         </div>
       ) : (
-        <div className="card kagami-card word-card">
-          <p className="big todays-word">
-            <QuotedText text={ana.todays_word ?? ""} />
-          </p>
-        </div>
+        /* 開いたとき、水面に映るように現れる（動きを減らす設定では静止） */
+        <MirrorWord text={ana.todays_word ?? ""} large appear />
       )}
-      <div className="card obs-card">
+      <div className="card">
         <h3>AIが観察したこと</h3>
-        <ul className="obs-list">
+        <ul className="rings">
           {ana.observations.map((o, i) => (
             <li key={i}>{o}</li>
           ))}
         </ul>
-        <p className="muted">AIは観察だけを返します。判断や診断はしません。</p>
+        <p className="muted card-foot">AIは観察だけを返します。判断や診断はしません。</p>
       </div>
     </section>
   );

@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { MORE_LABEL, NAV, Screen, TAB_IDS } from "../navigation";
 
 /* ------------------------------------------------------------------ */
-/* 下部タブ（案B）と「その他」シート                                     */
+/* 下部タブと「その他」シート                                           */
+/* 選ばれたタブ：上に藍の帯、アイコンの後ろに淡い水色の楕円（styles.css）   */
 /* 文言は NAV のものをそのまま使う。アイコンは装飾（aria-hidden）           */
 /* ------------------------------------------------------------------ */
 
@@ -39,18 +40,19 @@ const MoreIcon = () => (
 
 function Icon({ children, filled }: { children: JSX.Element; filled?: boolean }) {
   return (
-    <svg
-      className="tab-icon"
-      viewBox="0 0 24 24"
-      aria-hidden="true"
-      fill={filled ? "currentColor" : "none"}
-      stroke="currentColor"
-      strokeWidth="1.9"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      {children}
-    </svg>
+    <span className="tab-ico" aria-hidden="true">
+      <svg
+        className="tab-icon"
+        viewBox="0 0 24 24"
+        fill={filled ? "currentColor" : "none"}
+        stroke="currentColor"
+        strokeWidth="1.9"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        {children}
+      </svg>
+    </span>
   );
 }
 
