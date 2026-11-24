@@ -127,6 +127,54 @@ li + li { margin-top: var(--space-2); }
   font-size: 15px; font-weight: 700; line-height: 24px; text-align: center;
 }
 
+.appbar .diary-bell.open { background: rgba(220, 235, 243, 0.18); border-color: var(--moon); }
+.bell-wrap { display: inline-flex; flex: none; }
+
+/* ---- 通知パネル（ベルから開く。ヘッダーのすぐ下に、本文の列の幅で下ろす） ----
+   ヘッダーは覆わない（ベルでもう一度押して閉じられる）。下部タブより手前に出す */
+.notice-backdrop {
+  position: fixed; top: var(--appbar-h); left: 0; right: 0; bottom: 0; z-index: 35;
+  background: rgba(14, 44, 64, 0.4);
+  display: flex; justify-content: center; align-items: flex-start;
+  animation: fade-in 0.15s ease-out;
+}
+.notice-panel {
+  width: 100%; max-width: 640px; max-height: calc(100dvh - var(--appbar-h) - var(--space-6)); overflow-y: auto;
+  background: var(--card); border-radius: 0 0 20px 20px; box-shadow: var(--shadow-lift);
+  padding: var(--space-3) var(--gutter) var(--space-4);
+  animation: notice-down 0.2s ease-out;
+}
+.notice-panel:focus { outline: none; }
+.notice-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-2); }
+.notice-title { margin: 0; font-family: var(--serif); font-size: var(--fs-h3); line-height: 1.5; color: var(--deep); }
+.notice-close { flex: none; min-height: var(--btn-h-sub); padding: 0 var(--space-4); }
+.notice-empty { margin: var(--space-2) 0 var(--space-3); color: var(--muted); }
+.notice-list { list-style: none; margin: 0; padding: 0; }
+.notice-list li + li { margin-top: 0; border-top: 1px solid var(--line); }
+.notice-item {
+  width: 100%; display: flex; align-items: flex-start; justify-content: flex-start; gap: var(--space-3);
+  min-height: var(--btn-h); padding: var(--space-3) var(--space-2);
+  border: 0; border-radius: var(--radius-s); background: transparent; color: var(--ink);
+  font-weight: 400; text-align: left; white-space: normal; letter-spacing: 0; box-shadow: none;
+}
+.notice-item:hover { background: var(--page); }
+.notice-item.new { background: var(--tomo); }
+.notice-item.new:hover { background: var(--tomo); box-shadow: inset 0 0 0 1.5px var(--tomo-line); }
+.notice-avatar {
+  flex: none; width: 40px; height: 40px; margin-top: 2px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--serif); font-weight: 700; font-size: 19px; color: #fff; background: var(--tomo-ink);
+}
+.notice-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.6; }
+.notice-what { overflow-wrap: anywhere; }
+.notice-new {
+  display: inline-block; margin-right: var(--space-2); padding: 0 8px; border-radius: var(--radius-pill);
+  background: var(--card); border: 1px solid var(--tomo-line); color: var(--tomo-ink);
+  font-size: var(--fs-small); font-weight: 700; line-height: 1.6;
+}
+.notice-about, .notice-time { color: var(--muted); font-size: var(--fs-small); overflow-wrap: anywhere; }
+@keyframes notice-down { from { transform: translateY(-12px); opacity: 0; } to { transform: none; opacity: 1; } }
+
 @media (max-width: 374px) {
   .brand { font-size: 18px; letter-spacing: 0; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; }
   .appbar-in { gap: 6px; padding-left: 12px; }
@@ -490,6 +538,10 @@ dialog.confirm .row { margin-top: var(--space-5); }
   margin: 0 0 var(--space-3);
 }
 .post-empty { margin-top: var(--space-3); }
+/* 通知から開いた便り：ヘッダーに隠れない位置へ寄せ、数秒だけ藍の縁取り */
+.post { scroll-margin-top: calc(var(--appbar-h) + var(--space-4)); }
+.post:focus { outline: none; }
+.post.post-focus { box-shadow: 0 0 0 3px var(--indigo); transition: box-shadow 0.3s; }
 
 .action-bar { display: flex; gap: 2px; margin-top: var(--space-3); padding-top: 10px; border-top: 1px solid var(--tomo-line); }
 .act-btn {
