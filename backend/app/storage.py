@@ -82,6 +82,9 @@ class Store:
     def create_share(self, share: dict) -> dict: raise NotImplementedError
     def get_share(self, share_id: int) -> dict | None: raise NotImplementedError
     def update_share(self, share_id: int, fields: dict) -> dict | None: raise NotImplementedError
+    def delete_share(self, share_id: int) -> bool:
+        """便り（下書き・送信済み）を消す。付いたリアクション・返信も同じトランザクションで消す。消せたら True。"""
+        raise NotImplementedError
     def list_letters_for(self, user_id: str) -> list[dict]: raise NotImplementedError
     def list_letters_sent_by(self, user_id: str) -> list[dict]: raise NotImplementedError
     def add_stamp(self, share_id: int, from_user: str, stamp: str) -> dict: raise NotImplementedError
@@ -93,6 +96,8 @@ class Store:
     # letter replies（届いた便りへのテキスト返信）
     def add_reply(self, share_id: int, from_user: str, body: str) -> dict: raise NotImplementedError
     def list_replies(self, share_id: int) -> list[dict]: raise NotImplementedError
+    def get_reply(self, reply_id: int) -> dict | None: raise NotImplementedError
+    def delete_reply(self, reply_id: int) -> bool: raise NotImplementedError
 
 
 SCHEMA = """
@@ -450,6 +455,12 @@ class SQLiteStore(Store):
             c.execute(f"UPDATE shares SET {clause} WHERE id = ?", (*sets.values(), share_id))
         return self.get_share(share_id)
 
+    def delete_share(self, share_id: int) -> bool:
+        with self._lock, self._conn() as c:
+            c.execute("DELETE FROM stamps WHERE share_id = ?", (share_id,))
+            c.execute("DELETE FROM letter_replies WHERE share_id = ?", (share_id,))
+            return c.execute("DELETE FROM shares WHERE id = ?", (share_id,)).rowcount > 0
+
     def _letters(self, where: str, user_id: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
@@ -513,6 +524,15 @@ class SQLiteStore(Store):
                 "SELECT * FROM letter_replies WHERE share_id = ? ORDER BY id ASC", (share_id,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_reply(self, reply_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM letter_replies WHERE id = ?", (reply_id,)).fetchone()
+        return dict(row) if row else None
+
+    def delete_reply(self, reply_id: int) -> bool:
+        with self._lock, self._conn() as c:
+            return c.execute("DELETE FROM letter_replies WHERE id = ?", (reply_id,)).rowcount > 0
 
 
 def create_store() -> Store:

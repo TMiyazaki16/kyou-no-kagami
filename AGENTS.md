@@ -21,7 +21,7 @@
 - **AI は判定・診断をしない**：病名・医療的な助言を出さない。受診勧奨は定型文 `FIXED_CARE_PHRASE`（`analysis.py`）だけで、それもサーバーが付ける。Gemini には書かせない
 - **最初の7日間はベースライン**：記録した日数が7日以下のあいだは、変化を指摘しない（観察文はサーバーの定型文に差し替え、ルールも発動しない）
 - **ストリークを表示しない**：連続日数は出さず、「今週は○日できました」という週単位の肯定的なカウントにする。0日のときも責める文にしない
-- **共有は本人が送るまで発生しない**：AI の下書きを本人が編集して「送る」まで、誰にも届かない。送信後は書き換えられない。記録画面の「まだ誰にも届いていません」を消さない
+- **共有は本人が送るまで発生しない**：AI の下書きを本人が編集して「送る」まで、誰にも届かない。送信後は書き換えられない。ただし送信者本人による取り消し（削除）はでき、取り消すと家族の画面からも消え、付いたリアクション・返信も一緒に消える。自分の返信はいつでも削除できる（2026-11-24 オーナー決定、#21）。記録画面の「まだ誰にも届いていません」を消さない
 - **家族間で記録日数を比べない**：家族の記録回数を並べる・比べる表示を作らない
 - **今日の一言は本人の言葉を引用する**：その日の回答（または声の文字起こし）の言葉を「」でそのまま引用する。汎用の励まし文にしない。引用する言葉がないときは、一言の代わりに案内文（`kind: "voice_notice"`）を返す
 
@@ -37,14 +37,14 @@ backend/
   app/analysis.py     日次解析。Gemini / モックの切替と、Gemini 出力の後段ガード
   app/rules.py        変化への気づきルール（観察文を返す）
   scripts/seed_demo.py  デモデータ投入
-  tests/test_api.py   TestClient による検証（unittest）。便りのリアクション・返信・写真は TestLetterReactions
+  tests/test_api.py   TestClient による検証（unittest）。便りのリアクション・返信・写真は TestLetterReactions、下書きの破棄・記録を選んだ下書き・取り消し・返信の削除は TestShareDeleteAndPickRecord
   tests/test_mysql_store.py  MySQLStore の検証（オフライン検査は常時、実機検査は KAGAMI_TEST_MYSQL=1 のときだけ）
   tests/test_uploads.py  保存先の切替の検証（GCS はフェイクの Client。実機は使わない）
 frontend/src/
   App.tsx             外枠のみ（ログイン確認・ヘッダー・ナビ・画面の切替）。画面の中身は書かない
   navigation.ts       Screen（画面ID）・NAV（ナビの並びと文言）・Ctx（各画面に渡す共通 props）
   screens/            1画面1ファイル（全10画面＋ログイン/登録 AuthScreen）。ファイル名＝コンポーネント名
-  components/         2画面以上・外枠で使う部品（WeeklyMessage・WeekCard、BottomTabs、DiaryBell＝ヘッダーの通知ベル、水面の部品：WaterBand＝帯・MirrorWord＝今日の一言の水鏡・WaveLines）
+  components/         2画面以上・外枠で使う部品（WeeklyMessage・WeekCard、BottomTabs、DiaryBell＝ヘッダーの通知ベル、水面の部品：WaterBand＝帯・MirrorWord＝今日の一言の水鏡・WaveLines、ConfirmDialog＝取り消し・破棄の確認）
   styles.css          デザイン「水面」（#19）。色・寸法は :root の CSS 変数、部品は共通クラス（.card・button.primary・.notice・.band・.mirror・.stream・.rings・.tab）。画面ごとの場当たりの色・寸法を足さない。入力中にタブ・保存ボタンの位置を切り替えない（クリックが届かなくなる）
   lib/                React にも API にも依存しない小関数（format.ts：localDateStr・errText、audio.ts：録音形式、diarySeen.ts：通知バッジの既読時刻を localStorage に置く）
   api.ts              API クライアントと型。トークンを localStorage に置き Authorization ヘッダーで送る
@@ -57,7 +57,7 @@ frontend/src/
 - 登録は表示名＋メール＋パスワード（8文字以上）。メールは小文字化して一意。パスワードは `hashlib.pbkdf2_hmac`（SHA-256、ユーザーごとの salt、600,000 回）で `pbkdf2_sha256$回数$salt$hash` 形式で保存する。追加依存なし
 - セッションは不透明トークン（`secrets.token_urlsafe(32)`、30日）。サーバーには SHA-256 だけを保存し、本体を返すのは登録・ログインの応答の1回だけ。ログアウトでサーバー側のセッションを消す
 - `/api/health` と `/api/auth/register`・`/api/auth/login` 以外の `/api/*` は `Authorization: Bearer <token>` 必須（なければ 401）。誰のデータかは常にトークンから決める。リクエストの `user_id` は受け付けない（送られても無視）
-- 他人の記録の参照・解析・共有は 403、他人の下書きの編集・送信は 403、送信済みの変更は 409
+- 他人の記録の参照・解析・共有は 403、他人の下書きの編集・送信・破棄は 403、送信済みの変更は 409。下書きの破棄は `DELETE /api/shares/{id}`（送信済みは 409）、送信の取り消しは `DELETE /api/letters/{id}`（送った本人だけ。`Store.delete_share` が反応・返信ごと消す）、返信の削除は `DELETE /api/letters/{id}/replies/{reply_id}`（書いた本人だけ）
 - 家族コードは `XXXX-XXXX-XXXX`（紛らわしい文字を除く31文字×12桁）。相手のコードを入れると双方向に連携する（コードを伝えること＝同意とみなす）。解除はどちらからでもでき、解除後は作りかけの下書きも送れず、スタンプも返せない（届いた便りは残る）
 - **連携しても記録は届かない**：連携は「便りを送れる相手」を決めるだけ。連携相手の記録・一言・観察・週のカウントを見せる API や画面を作らない（不変条件「共有は本人が送るまで発生しない」「記録日数を比べない」を守るため）
 - 届いた便りへのリアクション（`STAMPS`＝「いいね」＋旧スタンプ。保存は `stamps` 表、`toggle_stamp` で人×種類ごとに1つ）と返信（`letter_replies` 表、200字まで）は、受け取った連携中の相手だけ。既読表示は作らない
@@ -234,7 +234,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
 | 検証スキル | `verify-app` |
 | テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
-| テストの期待値 | `Ran 119 tests` / `OK (skipped=1)`（2026-11-23 時点。skip は MySQL 実機検査）。テストを足したら更新する |
+| テストの期待値 | `Ran 131 tests` / `OK (skipped=1)`（2026-11-24 時点。skip は MySQL 実機検査）。テストを足したら更新する |
 | ビルド | `cd frontend && npm run build` |
 | 画面確認用 Python | `playwright` が入った Python（アプリの依存ではない。無ければ `verify-app` の 3-1 で別 venv を作る） |
 | 不変条件 | このファイルの「仕様の不変条件」 |

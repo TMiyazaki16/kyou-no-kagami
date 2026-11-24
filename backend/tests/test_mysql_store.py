@@ -107,6 +107,7 @@ class TestMySQLOffline(unittest.TestCase):
             st.add_stamp(1, "u2", "ありがとう"); st.list_stamps(1)
             st.toggle_stamp(1, "u2", "いいね")
             st.add_reply(1, "u2", "返信"); st.list_replies(1)
+            st.get_reply(1); st.delete_reply(1); st.delete_share(1)
             st.reset_all()
 
         self.assertGreater(len(executed), 40)
@@ -203,6 +204,21 @@ class TestMySQLLive(unittest.TestCase):
         self.assertEqual([x["body"] for x in letters[0]["replies"]], ["見に行くね🌹", "二通目"])
         self.assertEqual(letters[0]["replies"][0]["id"], rp["id"])
         self.assertEqual(st.list_letters_sent_by("u1")[0]["id"], s["id"])
+
+        # 返信の削除（1件だけ）と、便りの取り消し（反応・返信ごと消える）
+        self.assertEqual(st.get_reply(rp["id"])["body"], "見に行くね🌹")
+        self.assertTrue(st.delete_reply(rp["id"]))
+        self.assertFalse(st.delete_reply(rp["id"]))
+        self.assertIsNone(st.get_reply(rp["id"]))
+        self.assertEqual([x["body"] for x in st.list_replies(s["id"])], ["二通目"])
+        other = st.create_share({"from_user": "u1", "to_user": "u2", "draft_text": "別の下書き"})
+        st.add_reply(other["id"], "u2", "残る返信")
+        self.assertTrue(st.delete_share(s["id"]))
+        self.assertFalse(st.delete_share(s["id"]))
+        self.assertIsNone(st.get_share(s["id"]))
+        self.assertEqual((st.list_stamps(s["id"]), st.list_replies(s["id"])), ([], []))
+        self.assertEqual(st.list_letters_for("u2"), [])
+        self.assertEqual([x["body"] for x in st.list_replies(other["id"])], ["残る返信"])
 
         self.assertTrue(st.remove_family_link("u1", "u2"))
         self.assertFalse(st.remove_family_link("u1", "u2"))
