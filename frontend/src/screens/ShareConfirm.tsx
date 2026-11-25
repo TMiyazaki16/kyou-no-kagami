@@ -24,7 +24,7 @@ function recordLabel(r: RecordItem, today: string): string {
 /* 引用は書きかえられない。回答そのもの（2問の答え・声）は届かない。          */
 /* 選んだ家族それぞれに、別々の便りとして届く。同じ日を同じ人に送るのは1回だけ。 */
 /* ------------------------------------------------------------------ */
-export function ShareConfirm({ family, go }: Ctx) {
+export function ShareConfirm({ family, go, openDiary }: Ctx) {
   // どの日の記録を共有するか。初期は今日の記録（なければ最新の記録）
   const [records, setRecords] = useState<RecordItem[] | null>(null);
   const [recordId, setRecordId] = useState<number | null>(null);
@@ -33,7 +33,6 @@ export function ShareConfirm({ family, go }: Ctx) {
   const [comment, setComment] = useState("");
   // 「写真も一緒に届ける」。既定はオフ（記録に写真があっても、本人がオンにしたときだけ届く）
   const [includePhoto, setIncludePhoto] = useState(false);
-  const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -80,7 +79,6 @@ export function ShareConfirm({ family, go }: Ctx) {
     if (!preview || recordId === null) return;
     setBusy(true);
     setError("");
-    setStatus("");
     try {
       const { letters } = await api.sendLetters(
         recordId,
@@ -90,18 +88,18 @@ export function ShareConfirm({ family, go }: Ctx) {
       );
       const names = letters.map((l) => l.to_name).join("・");
       const withPhoto = letters.some((l) => l.photo_url);
-      setStatus(
-        `✓ ${names}へ${withPhoto ? "、写真と一緒に" : ""}届けました。` +
+      // 送れたら家族の日記へ移り、送った便りを並んだ状態で見せる（お知らせは日記の上部に一度だけ）。
+      // 共有画面へ戻ってきたときは、開き直しのプレビューで宛先が「送信済み」になる
+      openDiary({
+        ids: letters.map((l) => l.id),
+        notice:
+          `✓ ${names}へ${withPhoto ? "、写真と一緒に" : ""}届けました。` +
           (letters.length > 1 ? "それぞれに別の便りとして届いています。" : ""),
-      );
-      setComment("");
-      setIncludePhoto(false);
-      await loadPreview(recordId);
+      });
     } catch (e) {
       setError(`送れませんでした: ${errText(e)}`);
       // 送信済みの相手が増えていた（別の端末で送ったなど）ときに表示を合わせる
       loadPreview(recordId).catch(() => {});
-    } finally {
       setBusy(false);
     }
   };
@@ -131,10 +129,7 @@ export function ShareConfirm({ family, go }: Ctx) {
           <select
             id="share-record"
             value={recordId ?? ""}
-            onChange={(e) => {
-              setStatus("");
-              setRecordId(Number(e.target.value));
-            }}
+            onChange={(e) => setRecordId(Number(e.target.value))}
             disabled={busy}
           >
             {records.map((r) => (
@@ -215,7 +210,6 @@ export function ShareConfirm({ family, go }: Ctx) {
             </>
           )}
           {preview && !preview.feedback && <p className="notice">{preview.unavailable}</p>}
-          {status && <p className="ok">{status}</p>}
           {error && <p className="error">{error}</p>}
         </div>
       )}

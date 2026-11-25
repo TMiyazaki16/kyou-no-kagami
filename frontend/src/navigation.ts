@@ -25,11 +25,19 @@ export const NAV: { id: Screen; label: string }[] = [
   { id: "disclaimer", label: "免責表示" },
 ];
 
+/** 「家族の日記」を開くときに渡すもの：強調する便り（先頭の1通へスクロール）と、上部に一度だけ出すお知らせ */
+export interface DiaryFocus {
+  ids: number[];
+  notice?: string;
+}
+
 /** 各画面に渡す共通の props（ログイン中の本人・連携家族・画面遷移・再取得） */
 export interface Ctx {
   me: Me;
   family: FamilyMember[];
   go: (s: Screen) => void;
+  /** 「家族の日記」へ移り、指定の便りを強調する（通知の行・送信の直後） */
+  openDiary: (focus: DiaryFocus) => void;
   refreshMe: () => Promise<void>;
 }
 

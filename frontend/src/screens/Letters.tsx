@@ -4,7 +4,7 @@ import { charCount, errText, localDateTimeStr } from "../lib/format";
 import { markDiarySeen } from "../lib/diarySeen";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { FeedbackQuote } from "../components/FeedbackQuote";
-import type { Ctx } from "../navigation";
+import type { Ctx, DiaryFocus } from "../navigation";
 
 const LIKE = "いいね";
 
@@ -124,12 +124,13 @@ export function Letters({
   me,
   go,
   onSeen,
-  focusId,
+  focus,
   onFocused,
 }: Ctx & {
   onSeen?: () => void;
-  /** 通知パネルの行から開いたとき：その便りまでスクロールして、しばらく強調する */
-  focusId?: number | null;
+  /** 通知パネルの行・送信の直後に開いたとき：先頭の便りまでスクロールして、指定の便りをしばらく強調する */
+  focus?: DiaryFocus | null;
+  /** focus を受け取ったら呼ぶ（App 側の値を消して、一度だけにする） */
   onFocused?: () => void;
 }) {
   const [posts, setPosts] = useState<Share[] | null>(null);
@@ -140,21 +141,40 @@ export function Letters({
   const [errors, setErrors] = useState<Record<number, string>>({});
   const replyRefs = useRef<Record<number, HTMLTextAreaElement | null>>({});
   const [pending, setPending] = useState<Pending | null>(null);
-  const [highlight, setHighlight] = useState<number | null>(null);
+  const [highlight, setHighlight] = useState<number[]>([]);
+  // 受け取った focus（App 側はすぐ消す）。便りが読み込めたらスクロール・強調して空にする
+  const [pendingFocus, setPendingFocus] = useState<number[]>([]);
+  // 送信の直後に出すお知らせ。この画面を離れると消える（App にも localStorage にも残さない）
+  const [notice, setNotice] = useState("");
 
-  // 通知から来たとき：便りが読み込めたら該当の投稿を画面の中ほどへ寄せ、フォーカスして数秒だけ縁取る
   useEffect(() => {
-    if (focusId == null || posts === null) return;
+    if (!focus) return;
+    setPendingFocus(focus.ids);
+    setNotice(focus.notice ?? "");
     onFocused?.();
-    const el = document.getElementById(`post-${focusId}`);
-    if (!el) return; // 取り消された便りなど：家族の日記の先頭のまま
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.focus({ preventScroll: true });
-    setHighlight(focusId);
-  }, [focusId, posts, onFocused]);
+  }, [focus, onFocused]);
+
+  // 便りが読み込めたら先頭の1通へ寄せ（通知からは画面の中ほど）、フォーカスして、指定の便りを数秒だけ縁取る
   useEffect(() => {
-    if (highlight === null) return;
-    const t = window.setTimeout(() => setHighlight(null), 2600);
+    if (pendingFocus.length === 0 || posts === null) return;
+    setPendingFocus([]);
+    const ids = posts.filter((l) => pendingFocus.includes(l.id)).map((l) => l.id);
+    // タイムラインは新しい順なので、指定の便りのうちいちばん上の1通へ寄せる
+    const top = ids.length > 0 ? document.getElementById(`post-${ids[0]}`) : null;
+    if (!top) return; // 取り消された便りなど：家族の日記の先頭のまま
+    if (notice) {
+      // 送った直後：上部のお知らせと便りの書き出しを一緒に見せたい。書き出しが見えていれば動かさない
+      if (top.getBoundingClientRect().top > window.innerHeight * 0.6)
+        top.scrollIntoView({ block: "start", behavior: "smooth" });
+    } else {
+      top.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    top.focus({ preventScroll: true });
+    setHighlight(ids);
+  }, [pendingFocus, posts, notice]);
+  useEffect(() => {
+    if (highlight.length === 0) return;
+    const t = window.setTimeout(() => setHighlight([]), 2600);
     return () => window.clearTimeout(t);
   }, [highlight]);
 
@@ -237,6 +257,11 @@ export function Letters({
     <section className="letters">
       <h2>家族の日記</h2>
       <p className="lead">あなたと家族が「送る」と決めた便りだけが、ここに並びます。</p>
+      {notice && (
+        <p className="ok" role="status">
+          {notice}
+        </p>
+      )}
       {posts !== null && posts.length === 0 && (
         <p className="muted">まだ便りはありません。送りたいときは「家族への共有」からどうぞ。</p>
       )}
@@ -257,7 +282,7 @@ export function Letters({
               <article
                 id={`post-${l.id}`}
                 tabIndex={-1}
-                className={`card post${mine ? " mine" : " family"}${highlight === l.id ? " post-focus" : ""}`}
+                className={`card post${mine ? " mine" : " family"}${highlight.includes(l.id) ? " post-focus" : ""}`}
                 aria-label={`${l.from_name}の便り`}
               >
                 <header className="post-head">
