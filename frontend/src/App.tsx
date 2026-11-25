@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, FamilyMember, Me, session, UNAUTHORIZED_EVENT } from "./api";
-import { Ctx, Screen } from "./navigation";
+import { Ctx, DiaryFocus, Screen } from "./navigation";
 import { BottomTabs } from "./components/BottomTabs";
 import { AuthScreen } from "./screens/AuthScreen";
 import { Home } from "./screens/Home";
@@ -28,9 +28,10 @@ export default function App() {
   // 通知パネル（ベルから開く）。notices が null の間は読み込み中
   const [panelOpen, setPanelOpen] = useState(false);
   const [notices, setNotices] = useState<DiaryNotice[] | null>(null);
-  // 通知の行から開いた便り（家族の日記がそこまでスクロールして強調する）
-  const [focusLetter, setFocusLetter] = useState<number | null>(null);
-  const clearFocus = useCallback(() => setFocusLetter(null), []);
+  // 家族の日記で強調する便り（通知の行から開いた便り・送った直後の便り）と、上部に一度だけ出すお知らせ。
+  // Letters が受け取ったらすぐ消すので、日記を離れて戻っても出ない（永続化しない）
+  const [diaryFocus, setDiaryFocus] = useState<DiaryFocus | null>(null);
+  const clearFocus = useCallback(() => setDiaryFocus(null), []);
   const bellWrap = useRef<HTMLSpanElement>(null);
   const closePanel = useCallback(() => {
     setPanelOpen(false);
@@ -126,7 +127,11 @@ export default function App() {
     setScreen(s);
     window.scrollTo(0, 0); // 画面を切り替えたら先頭から読めるようにする
   };
-  const ctx: Ctx = { me, family, go, refreshMe };
+  const openDiary = (focus: DiaryFocus) => {
+    setDiaryFocus(focus);
+    go("letters");
+  };
+  const ctx: Ctx = { me, family, go, openDiary, refreshMe };
 
   // ベル：パネルを開いた時点で、いま見えている反応を既読にしてバッジを消す（この端末の localStorage だけ）
   const openPanel = () => {
@@ -144,8 +149,7 @@ export default function App() {
   };
   const pickNotice = (letterId: number) => {
     setPanelOpen(false);
-    setFocusLetter(letterId);
-    go("letters");
+    openDiary({ ids: [letterId] });
   };
 
   return (
@@ -169,7 +173,7 @@ export default function App() {
         {screen === "reflect" && <Reflect />}
         {screen === "share" && <ShareConfirm {...ctx} />}
         {screen === "letters" && (
-          <Letters {...ctx} onSeen={clearBadge} focusId={focusLetter} onFocused={clearFocus} />
+          <Letters {...ctx} onSeen={clearBadge} focus={diaryFocus} onFocused={clearFocus} />
         )}
         {screen === "dev" && <DevView />}
         {screen === "settings" && <Settings {...ctx} />}
