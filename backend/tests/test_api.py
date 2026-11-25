@@ -1359,6 +1359,49 @@ class TestMirrorWord(unittest.TestCase):
         guidance = guidance.split("【役割分担】", 1)[0]
         self.assertEqual(analysis.find_ng_words(guidance), [])
 
+    REPORT_TONE = ("が見られます", "が向けられています", "がうかがえます", "という様子です")
+
+    def test_prompt_asks_for_warm_direct_tone(self):
+        """#33：本人に語りかける です・ます の文体を、一言・観察・候補・写真・声のすべてに指示する。"""
+        req = {"inputs": {"gratitude": "庭のバラ", "mood": "元気だけど眠い"},
+               "baseline_day": 9, "baseline_period": False}
+        p = analysis._gemini_prompt(req, with_audio=True, with_photo=True)
+        self.assertIn("【文体】", p)
+        self.assertIn("直接語りかける", analysis.SYSTEM_RULES)
+        self.assertIn("敬語（です・ます）は保ち", analysis.SYSTEM_RULES)
+        self.assertIn("三人称の観察レポート調", analysis.SYSTEM_RULES)
+        self.assertIn("観察の候補・写真や声の様子", analysis.SYSTEM_RULES)
+        self.assertIn("語りかける", analysis.CANDIDATE_RULES)
+        self.assertIn("語りかける形", analysis.PHOTO_RULES)
+        self.assertIn("声の様子に触れるときも、本人に語りかける形", p)
+        # 文体の指示を足しても、断定の禁止・外見の禁止は残っている
+        self.assertIn("体調の断定", analysis.SYSTEM_RULES)
+        self.assertIn("外見（体型・痩せた／太った・老けた・顔色・肌・髪・しわ等）には一切触れません", analysis.PHOTO_RULES)
+        # 指示の中の良い例は、ガードに引っかからない
+        examples = re.findall(r"「([^」]*)」", analysis.SYSTEM_RULES.split("【文体】", 1)[1].split("\n", 1)[0])
+        for ex in ("元気そうですね！", "やわらかい光の中で過ごせたんですね"):
+            self.assertIn(ex, examples)
+            self.assertEqual(analysis.find_assertive_state(ex), [])
+            self.assertEqual(analysis.find_appearance_words(ex), [])
+            self.assertEqual(analysis.find_ng_words(ex), [])
+
+    def test_mock_texts_are_not_report_tone(self):
+        """#33：モックの一言・観察文も三人称のレポート調にしない。"""
+        texts = [analysis.PHOTO_RECEIVED_OBSERVATION]
+        for g, m, s in (("庭のバラ", "元気だけど眠い", ""), ("", "疲れた", ""), ("散歩", "疲れた", ""),
+                        ("散歩", "まあまあ元気", ""), ("散歩", "元気", ""), ("", "元気！", ""),
+                        ("散歩", "ふつう", ""), ("", "ふつう", ""), ("娘の電話", "", ""), ("", "", "眠い")):
+            for turn in range(3):
+                texts.append(analysis._mirror_word(g, m, s, turn))
+        for trends in ([{"kind": "word", "word": "眠い", "days": 2}],
+                       [{"kind": "word", "word": "眠い", "days": 2}, {"kind": "short_answers", "days": 2}],
+                       [{"kind": "short_answers", "days": 3}]):
+            texts.append(analysis._trend_sentence(trends, 0))
+        for t in texts:
+            for w in self.REPORT_TONE:
+                self.assertNotIn(w, t)
+            self.assertNotIn("この方", t)
+
 
 class TestRecentTrends(Base):
     """今日の一言に直近数日の流れを映す（#9）。"""
@@ -1486,7 +1529,7 @@ class TestRecentTrends(Base):
         rec = self.post_record(mood="元気だけど眠い").json()
         a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
         self.assertEqual(a["baseline_day"], 9)
-        self.assertIn("ここ2日、「眠い」という言葉が続き、言葉も短めになっています。", a["todays_word"])
+        self.assertIn("ここ2日、「眠い」という言葉が続き、言葉も短めになっていますね。", a["todays_word"])
         self.assertIn("「元気」と「眠い」", a["todays_word"])
 
     def test_trend_wording_has_no_assertive_or_ng_words(self):
