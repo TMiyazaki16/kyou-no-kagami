@@ -4,6 +4,8 @@ Run:  uvicorn app.main:app --reload --port 8000
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -57,6 +59,31 @@ MAX_BYTES = {"photo": 10 * 1024 * 1024, "audio": 5 * 1024 * 1024}
 def today_jst() -> date:
     """H-7: 日付は常にサーバー側で JST から決める。"""
     return datetime.now(JST).date()
+
+
+# 本番向けガード（#34）
+REGISTRATION_CLOSED_MESSAGE = "現在、新規登録は受け付けていません。デモアカウントでログインしてください"
+DEFAULT_GEMINI_DAILY_LIMIT_PER_USER = 3
+DEFAULT_GEMINI_DAILY_LIMIT_TOTAL = 100
+_FALSY = {"0", "false", "no", "off"}
+
+
+def registration_enabled() -> bool:
+    """REGISTRATION_ENABLED が 0 / false / no / off なら新規登録を止める（未設定・それ以外は有効）。"""
+    return os.environ.get("REGISTRATION_ENABLED", "").strip().lower() not in _FALSY
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+
+
+def gemini_daily_limits() -> tuple[int, int]:
+    """(1ユーザーあたり, 全体) の1日の実 Gemini 呼び出し上限。環境変数で上書きできる。"""
+    return (_env_int("GEMINI_DAILY_LIMIT_PER_USER", DEFAULT_GEMINI_DAILY_LIMIT_PER_USER),
+            _env_int("GEMINI_DAILY_LIMIT_TOTAL", DEFAULT_GEMINI_DAILY_LIMIT_TOTAL))
 
 
 # --------------------------------------------------------------------------
@@ -149,7 +176,8 @@ def _remove_file(path: str | None) -> None:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "app": "きょうのかがみ", "version": "0.01", "today": today_jst().isoformat()}
+    return {"status": "ok", "app": "きょうのかがみ", "version": "0.01", "today": today_jst().isoformat(),
+            "registration_enabled": registration_enabled()}
 
 
 @app.get("/api/stamps")
@@ -186,6 +214,8 @@ def _start_session(user: dict) -> dict:
 
 @app.post("/api/auth/register")
 def register(body: RegisterIn):
+    if not registration_enabled():
+        raise HTTPException(403, REGISTRATION_CLOSED_MESSAGE)
     problem = auth.validate_registration(body.display_name, body.email, body.password)
     if problem:
         raise HTTPException(400, problem)
@@ -370,17 +400,69 @@ def _load_media(path: str | None, ext_to_mime: dict[str, str]) -> tuple[bytes, s
     return (data, mime) if data is not None else None
 
 
+def input_fingerprint(rec: dict) -> str:
+    """解析の入力の同一性（2問の回答・文字起こし・声・写真）。同じなら同じ値になる。"""
+    fields = [rec.get(k) or "" for k in ("gratitude", "mood", "transcript", "audio_path", "photo_path")]
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _gemini_answered(ana: dict) -> bool:
+    """前回の解析で実 Gemini が応答していたか（ガードで差し替えた場合も含む）。
+    Gemini エラー・回数上限・キー未設定でモックになったものは、もう一度 Gemini を試せるよう再利用しない。"""
+    reason = ana.get("fallback_reason") or ""
+    return reason == "" or reason.startswith("guard_")
+
+
+def _reuse_analysis(rec: dict, fingerprint: str) -> dict | None:
+    """内容が変わっていない記録の再解析（#34）。前回の結果を写して保存し直す（実 Gemini は呼ばない）。
+
+    保存し直すのは、上書き保存（M-2）で records.created_at が新しくなると前回の解析が「古い」扱いになるため。"""
+    prev = store.analysis_for_record(rec["id"])
+    if not prev or prev.get("request", {}).get("input_fingerprint") != fingerprint or not _gemini_answered(prev):
+        return None
+    response = {**prev["response"], "reused": {
+        "reason": "unchanged_input", "from_analysis_id": prev["id"], "original_created_at": prev["created_at"],
+    }}
+    return store.save_analysis({
+        "record_id": rec["id"], "user_id": rec["user_id"], "date": rec["date"],
+        "todays_word": prev["todays_word"], "observations": prev["observations"],
+        "engine": prev["engine"], "baseline_day": prev["baseline_day"],
+        "request": prev["request"], "response": response,
+        "kind": prev["kind"], "notice": prev["notice"], "fallback_reason": prev["fallback_reason"],
+    })
+
+
+def _gemini_quota(user_id: str):
+    """analysis.analyze に渡す回数ガード。実 Gemini を呼ぶ直前に1回だけ呼ばれる（JST の今日で数える）。"""
+    def consume() -> dict | None:
+        day = today_jst().isoformat()
+        per_user, total = gemini_daily_limits()
+        scope = store.consume_gemini_quota(day, user_id, per_user, total)
+        if scope is None:
+            return None
+        return {"scope": scope, "day": day, "limit": per_user if scope == "user" else total}
+    return consume
+
+
 def run_analysis(rec: dict) -> dict:
     """記録1件を解析して保存する（API と scripts/seed_demo.py の共通処理）。"""
     user_id = rec["user_id"]
+    gemini_on = bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    if gemini_on:
+        reused = _reuse_analysis(rec, input_fingerprint(rec))
+        if reused:
+            return reused
     baseline_day = store.distinct_record_days(user_id, rec["date"])
     previous = store.previous_record(user_id, rec["id"])
     history = [r for r in store.list_records(user_id) if r["date"] <= rec["date"]]
     audio = _load_media(rec.get("audio_path"), EXT_TO_AUDIO_MIME)
     photo = _load_media(rec.get("photo_path"), EXT_TO_PHOTO_MIME)
-    result = analysis_mod.analyze(rec, baseline_day, previous, history, audio, photo)
+    result = analysis_mod.analyze(rec, baseline_day, previous, history, audio, photo,
+                                  quota=_gemini_quota(user_id))
     if result.get("transcript") and not (rec.get("transcript") or "").strip():
-        store.update_record(rec["id"], {"transcript": result["transcript"]})
+        rec = store.update_record(rec["id"], {"transcript": result["transcript"]}) or rec
+    # 保存後の記録（文字起こしを書き込んだ後）の内容で同一性を残す。次の再解析はこれと比べる
+    result["request"]["input_fingerprint"] = input_fingerprint(rec)
     return store.save_analysis({
         "record_id": rec["id"], "user_id": user_id, "date": rec["date"],
         "todays_word": result["todays_word"], "observations": result["observations"],

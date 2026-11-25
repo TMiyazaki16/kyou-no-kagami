@@ -99,6 +99,12 @@ class Store:
     def get_reply(self, reply_id: int) -> dict | None: raise NotImplementedError
     def delete_reply(self, reply_id: int) -> bool: raise NotImplementedError
 
+    # gemini usage（実 Gemini の呼び出し回数。JST の日付 × ユーザー／全体）
+    def consume_gemini_quota(self, day: str, user_id: str, user_limit: int, global_limit: int) -> str | None:
+        """実 Gemini を1回呼ぶ枠を確保する。ユーザー・全体とも上限未満なら両方を1増やして None を返す。
+        どちらかが上限に達していれば何も増やさず、"user" か "global"（全体を先に判定）を返す。"""
+        raise NotImplementedError
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
@@ -173,7 +179,21 @@ CREATE TABLE IF NOT EXISTS family_links (
     created_at TEXT NOT NULL,
     PRIMARY KEY (user_a, user_b)
 );
+CREATE TABLE IF NOT EXISTS gemini_usage (
+    day TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    calls INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (day, scope)
+);
 """
+
+GEMINI_SCOPE_GLOBAL = "global"
+
+
+def gemini_user_scope(user_id: str) -> str:
+    """gemini_usage.scope のユーザー単位の値（全体は GEMINI_SCOPE_GLOBAL）。"""
+    return f"user:{user_id}"
 
 _USER_PUBLIC_COLUMNS = "id, email, display_name, family_code, created_at"
 
@@ -533,6 +553,30 @@ class SQLiteStore(Store):
     def delete_reply(self, reply_id: int) -> bool:
         with self._lock, self._conn() as c:
             return c.execute("DELETE FROM letter_replies WHERE id = ?", (reply_id,)).rowcount > 0
+
+    # ---- gemini usage ----------------------------------------------------
+    def consume_gemini_quota(self, day: str, user_id: str, user_limit: int, global_limit: int) -> str | None:
+        user_scope = gemini_user_scope(user_id)
+        with self._lock, self._conn() as c:
+            # 別プロセスと同時に数えても上限を超えないよう、読む前に書き込みロックを取る
+            c.execute("BEGIN IMMEDIATE")
+            rows = c.execute(
+                "SELECT scope, calls FROM gemini_usage WHERE day = ? AND scope IN (?, ?)",
+                (day, GEMINI_SCOPE_GLOBAL, user_scope),
+            ).fetchall()
+            used = {r["scope"]: int(r["calls"]) for r in rows}
+            if used.get(GEMINI_SCOPE_GLOBAL, 0) >= global_limit:
+                return "global"
+            if used.get(user_scope, 0) >= user_limit:
+                return "user"
+            now = _now()
+            for scope in (GEMINI_SCOPE_GLOBAL, user_scope):
+                c.execute(
+                    "INSERT INTO gemini_usage (day, scope, calls, updated_at) VALUES (?, ?, 1, ?)"
+                    " ON CONFLICT (day, scope) DO UPDATE SET calls = calls + 1, updated_at = excluded.updated_at",
+                    (day, scope, now),
+                )
+        return None
 
 
 def create_store() -> Store:

@@ -150,10 +150,16 @@ Cloud Run は複数インスタンス・再起動ありで、ローカルディ�
   - 連携しても、記録・一言・観察が相手に見えることはありません。届くのは本人が編集して「送る」と決めた便りだけです。
   - 連携相手が複数いる場合は、下書きを作るときに送る相手を選びます。
 - **パスワード・トークンはログやレスポンスに出しません**（トークンは発行時の応答で1回だけ返します）。
+- **新規登録の停止（#34）**：環境変数 `REGISTRATION_ENABLED` を `false`（`0` / `no` / `off` も可）にすると、
+  `POST /api/auth/register` は 403（「現在、新規登録は受け付けていません。デモアカウントでログインしてください」）を返します。
+  ログイン・既存アカウント・発行済みのセッションには影響しません。未設定（ローカル）は従来どおり登録できます。
+  登録画面は `GET /api/health` の `registration_enabled` を見て、フォームを残したまま登録ボタンを押せなくし、
+  「現在、新規登録は受け付けていません」と案内します。本番（審査用のデモ公開）で使う想定です。
 
 | エンドポイント | 内容 |
 |---|---|
-| `POST /api/auth/register` | `{display_name, email, password}` → `{token, user}` |
+| `GET /api/health` | 認証不要。`{status, app, version, today, registration_enabled}` |
+| `POST /api/auth/register` | `{display_name, email, password}` → `{token, user}`（`REGISTRATION_ENABLED=false` のときは 403） |
 | `POST /api/auth/login` | `{email, password}` → `{token, user}`（失敗は 401。メールの有無は区別しない） |
 | `POST /api/auth/logout` | セッションを消す |
 | `GET /api/me` | `{user: {id, email, display_name, family_code}, family: [{id, display_name}]}` |
@@ -244,6 +250,21 @@ npm run build      # 本番ビルド（型チェック込み）
   - 実際に応答したモデルは「仕組みを見る」の説明文とリクエストの `model` に出ます（`model_chain` が試す順、
     レスポンスの `gemini_attempts` が各呼び出しの結果）。全滅したときは `fallback_reason: "gemini_error"` です
   - CI/CD（`.github/workflows/ci-cd.yml`）は `GEMINI_FALLBACK_MODEL` を渡していないので、本番は既定の代替モデルを使います
+- **実 Gemini の回数上限（#34）**：実 Gemini を呼ぶのは、1ユーザーあたり1日3回・全体で1日100回まで
+  （JST の日付で数える。`GEMINI_DAILY_LIMIT_PER_USER` / `GEMINI_DAILY_LIMIT_TOTAL` で変更可、0 なら呼ばない）。
+  上限に達した解析は Gemini を呼ばずに既存のモック経路に落とし、`engine: "mock (quota fallback)"`、
+  `fallback_reason: "quota_user"`（そのユーザーの上限）/ `"quota_global"`（全体の上限。先に判定）、
+  レスポンスの `quota`（`{scope, day, limit}`）を残します。「仕組みを見る」にも理由が出ます。
+  - 数えるのは**実 Gemini を呼ぶ直前に1回**です。主モデル → 代替モデルの連鎖と再試行は、1回の解析でまとめて1回と数えます
+    （呼んだ結果が Gemini エラーやガードでのモック差し替えになっても1回に数えます）。キー未設定のモックは数えません
+  - カウンタは `gemini_usage` 表（`day` × `scope`＝`global` / `user:<id>`）に `Store.consume_gemini_quota` で持ちます
+    （SQLite は書き込みロック、MySQL は行ロックの中で判定するので、同時に解析しても上限を超えません）
+- **内容が変わっていない記録の再解析（#34）**：Gemini が使える設定で、前回の解析と入力（2問の回答・文字起こし・
+  声・写真）が同じなら、実 Gemini を呼ばずに前回の結果を写して保存し直します（回数にも数えません）。
+  入力の同一性は `request.input_fingerprint`（SHA-256）で比べ、再利用した解析のレスポンスには
+  `reused: {reason: "unchanged_input", from_analysis_id, original_created_at}` が付きます（「仕組みを見る」にも1行出ます）。
+  前回が Gemini エラー・回数上限・キー未設定のモックだったときは再利用せず、もう一度 Gemini を試します
+  （ガードでモックに差し替えた結果は、Gemini が応答した結果なので再利用します）
 - 音声がある場合は `inline_data` で Gemini に渡し、**文字起こしと一言の生成を1回の呼び出し**で行います。
   文字起こしは記録の `transcript` に保存されます。音声形式を受け付けられなかった場合、
   文字の入力があれば文字だけで再試行します。
@@ -345,6 +366,10 @@ npm run build      # 本番ビルド（型チェック込み）
 - フロントのキャッシュ：`assets/`（ハッシュ付きファイル名）は `max-age=31536000, immutable`、`index.html` は `no-cache`。
   新しい `assets/` → `index.html` → 削除同期の順に置くので、デプロイ中に参照切れが起きにくい順序になっています。
 - Gemini は任意です。`GEMINI_API_KEY_SECRET` を設定したときだけキーを Secret Manager から渡します（未設定ならモック）。
+- **新規登録の停止（`REGISTRATION_ENABLED=false`）は、まだワークフローから渡していません**（#34 時点）。
+  `--set-env-vars` は毎回置きかえるので、本番で登録を止めるにはオーナーがワークフローの `ENV_VARS` に
+  `REGISTRATION_ENABLED=false` を足す必要があります。実 Gemini の回数上限は既定値（1ユーザー1日3回・全体1日100回）が
+  環境変数なしで効きます。
 
 ### リポジトリの Variables
 

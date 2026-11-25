@@ -56,6 +56,11 @@ class Base(unittest.TestCase):
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("GEMINI_MODEL", None)
         os.environ.pop("GEMINI_FALLBACK_MODEL", None)
+        os.environ.pop("REGISTRATION_ENABLED", None)
+        # 回数ガード（#34）は既存のテスト（同じ日に何日分も解析する）を止めないよう大きくしておく。
+        # 上限の検証は TestGeminiQuota で小さい値に上書きする
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "1000"
+        os.environ["GEMINI_DAILY_LIMIT_TOTAL"] = "1000"
         # Gemini の再試行の待ちは実時間で眠らず、待った秒数だけ記録する
         self.sleeps: list = []
         self.sleep_patch = mock.patch.object(analysis, "_sleep", self.sleeps.append)
@@ -1017,7 +1022,8 @@ class TestGeminiFallback(Base):
         self.assertNotIn("病院", a["todays_word"])
         self.assertEqual(a["response"]["gemini"]["model"], self.FALLBACK)
         no_quote = {"todays_word": "今日もよくがんばりましたね。", "observations": []}
-        a, _ = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [no_quote]})
+        # 同じ内容だと前回の結果を再利用する（#34）ので、内容を変えて解析し直す
+        a, _ = self._analyze({self.PRIMARY: [E503], self.FALLBACK: [no_quote]}, mood="元気だよ")
         self.assertEqual(a["fallback_reason"], "guard_no_quote")
 
     def test_audio_transient_goes_to_fallback_with_audio(self):
@@ -2096,6 +2102,246 @@ class TestLegacyMigration(Base):
         fresh = SQLiteStore(os.path.join(self.dir, "fresh.db"))
         self.assertFalse(auth.migrate_legacy_users(fresh))
         self.assertIsNone(fresh.find_user_by_email("haha@demo.local"))
+
+
+# --------------------------------------------------------------------------
+class TestRegistrationFlag(Base):
+    """REGISTRATION_ENABLED（#34）。無効なら登録だけ 403、ログイン・既存アカウントはそのまま。"""
+
+    def _register(self, email="new@example.com"):
+        return self.anon.post("/api/auth/register",
+                              json={"display_name": "新しい人", "email": email, "password": "password-123"})
+
+    def test_enabled_by_default(self):
+        self.assertTrue(self.anon.get("/api/health").json()["registration_enabled"])
+        self.assertEqual(self._register().status_code, 200)
+
+    def test_disabled_rejects_register_but_keeps_login(self):
+        for value in ("false", "0", "OFF", " no "):
+            with self.subTest(value=value):
+                os.environ["REGISTRATION_ENABLED"] = value
+                self.assertFalse(self.anon.get("/api/health").json()["registration_enabled"])
+                r = self._register(f"new-{value.strip().lower()}@example.com")
+                self.assertEqual(r.status_code, 403)
+                self.assertIn("新規登録は受け付けていません", r.json()["detail"])
+                self.assertNotIn("token", r.json())
+        # 登録しようとしたメールのアカウントは作られていない
+        self.assertIsNone(self.store.find_user_by_email("new-false@example.com"))
+        # 既存アカウントのログインとセッションには影響しない
+        r = self.anon.post("/api/auth/login", json={"email": "mother@example.com", "password": "password-123"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.c.get("/api/me").status_code, 200)
+        self.assertEqual(self.client_for(r.json()["token"]).get("/api/records").status_code, 200)
+
+    def test_truthy_values_keep_registration_open(self):
+        for value in ("true", "1", "yes", ""):
+            with self.subTest(value=value):
+                os.environ["REGISTRATION_ENABLED"] = value
+                self.assertTrue(self.anon.get("/api/health").json()["registration_enabled"])
+        self.assertEqual(self._register().status_code, 200)
+
+
+# --------------------------------------------------------------------------
+class TestGeminiQuota(Base):
+    """実 Gemini の1日の回数上限（#34）。超えたら Gemini を呼ばずにモックへ。"""
+    PRIMARY = analysis.DEFAULT_GEMINI_MODEL
+    FALLBACK = analysis.DEFAULT_GEMINI_FALLBACK_MODEL
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "2"
+        os.environ["GEMINI_DAILY_LIMIT_TOTAL"] = "3"
+
+    def _analyze(self, mood, user="mother", script=None):
+        """内容を変えて記録し直し、解析する（同じ内容だと再利用になるため）。"""
+        call, calls = scripted_gemini(script or {self.PRIMARY: [OK_WORD]})
+        rec = self.post_record(user=user, gratitude="庭のバラ", mood=mood).json()
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.clients[user].post(f"/api/records/{rec['id']}/analyze").json()
+        return a, calls
+
+    def test_defaults(self):
+        os.environ.pop("GEMINI_DAILY_LIMIT_PER_USER")
+        os.environ.pop("GEMINI_DAILY_LIMIT_TOTAL")
+        self.assertEqual(main.gemini_daily_limits(), (3, 100))
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "abc"  # 読めない値は既定値
+        self.assertEqual(main.gemini_daily_limits(), (3, 100))
+
+    def test_per_user_limit_falls_back_to_mock(self):
+        for mood in ("元気", "元気だよ"):
+            a, calls = self._analyze(mood)
+            self.assertEqual((a["engine"], len(calls)), ("gemini", 1))
+        a, calls = self._analyze("少し眠い")
+        self.assertEqual(calls, [])  # Gemini は呼ばない
+        self.assertEqual(a["engine"], "mock (quota fallback)")
+        self.assertEqual(a["fallback_reason"], "quota_user")
+        self.assertEqual(a["response"]["quota"], {"scope": "user", "day": "2026-11-22", "limit": 2})
+        self.assertIn("庭のバラ", a["todays_word"])  # 既存のモック経路（本人の言葉を引用）
+        dev = self.c.get("/api/dev/latest-analysis").json()["analysis"]
+        self.assertEqual(dev["fallback_reason"], "quota_user")
+        # 上限はユーザーごと：娘はまだ呼べる
+        a, calls = self._analyze("元気", user="daughter")
+        self.assertEqual((a["engine"], len(calls)), ("gemini", 1))
+
+    def test_global_limit_falls_back_to_mock(self):
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "10"
+        os.environ["GEMINI_DAILY_LIMIT_TOTAL"] = "2"
+        self.assertEqual(self._analyze("元気")[0]["engine"], "gemini")
+        self.assertEqual(self._analyze("元気", user="daughter")[0]["engine"], "gemini")
+        for user in ("mother", "daughter"):
+            a, calls = self._analyze("少し眠い", user=user)
+            self.assertEqual(calls, [])
+            self.assertEqual(a["fallback_reason"], "quota_global")
+            self.assertEqual(a["response"]["quota"]["limit"], 2)
+
+    def test_counts_by_jst_day(self):
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "1"
+        self.assertEqual(self._analyze("元気")[0]["engine"], "gemini")
+        self.assertEqual(self._analyze("元気だよ")[0]["fallback_reason"], "quota_user")
+        self.today = TODAY + timedelta(days=1)  # JST の翌日は数え直し
+        self.assertEqual(self._analyze("元気")[0]["engine"], "gemini")
+
+    def test_fallback_chain_counts_once(self):
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "1"
+        # 主モデルで3回失敗→代替モデルで成功（呼び出しは4回）でも、数えるのは1回
+        a, calls = self._analyze("元気", script={self.PRIMARY: [E503], self.FALLBACK: [OK_WORD]})
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(a["engine"], "gemini")
+        self.assertEqual(self._analyze("元気だよ")[0]["fallback_reason"], "quota_user")
+
+    def test_gemini_error_still_counts(self):
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "1"
+        a, calls = self._analyze("元気", script={self.PRIMARY: [E503], self.FALLBACK: [E503]})
+        self.assertEqual((a["fallback_reason"], len(calls)), ("gemini_error", 6))
+        self.assertEqual(self._analyze("元気だよ")[0]["fallback_reason"], "quota_user")
+
+    def test_mock_without_key_is_not_counted(self):
+        os.environ.pop("GEMINI_API_KEY")
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "0"
+        a, _ = self._analyze("元気")
+        self.assertEqual((a["engine"], a["fallback_reason"]), ("mock", "no_api_key"))
+
+    def test_store_counter(self):
+        st, day = self.store, "2026-11-22"
+        self.assertIsNone(st.consume_gemini_quota(day, "u1", 2, 3))
+        self.assertIsNone(st.consume_gemini_quota(day, "u1", 2, 3))
+        self.assertEqual(st.consume_gemini_quota(day, "u1", 2, 3), "user")
+        self.assertIsNone(st.consume_gemini_quota(day, "u2", 2, 3))
+        # 全体が上限なら、ユーザーに余裕があっても "global"（全体を先に判定）
+        self.assertEqual(st.consume_gemini_quota(day, "u3", 2, 3), "global")
+        self.assertEqual(st.consume_gemini_quota(day, "u1", 2, 3), "global")
+        # 別の日は別に数える。上限 0 は呼ばない
+        self.assertIsNone(st.consume_gemini_quota("2026-11-23", "u1", 2, 3))
+        self.assertEqual(st.consume_gemini_quota("2026-11-23", "u1", 0, 3), "user")
+
+
+# --------------------------------------------------------------------------
+class TestUnchangedReanalysis(Base):
+    """同じ入力の再解析は実 Gemini を呼ばずに前回の結果を再利用する（#34）。"""
+    PRIMARY = analysis.DEFAULT_GEMINI_MODEL
+    FALLBACK = analysis.DEFAULT_GEMINI_FALLBACK_MODEL
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GEMINI_API_KEY"] = "test-key-SECRET"
+
+    def _run(self, rec_id, script=None):
+        call, calls = scripted_gemini(script or {self.PRIMARY: [OK_WORD]})
+        with mock.patch.object(analysis, "_call_gemini", call):
+            a = self.c.post(f"/api/records/{rec_id}/analyze").json()
+        return a, calls
+
+    def test_reanalysis_reuses_previous_result(self):
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        first, calls = self._run(rec["id"])
+        self.assertEqual((first["engine"], len(calls)), ("gemini", 1))
+        self.assertNotIn("reused", first["response"])
+        self.assertTrue(first["request"]["input_fingerprint"])
+        second, calls = self._run(rec["id"])
+        self.assertEqual(calls, [])  # Gemini を呼ばない
+        self.assertNotEqual(second["id"], first["id"])
+        for key in ("todays_word", "observations", "engine", "kind", "fallback_reason", "request"):
+            self.assertEqual(second[key], first[key], key)
+        self.assertEqual(second["response"]["reused"]["reason"], "unchanged_input")
+        self.assertEqual(second["response"]["reused"]["from_analysis_id"], first["id"])
+        dev = self.c.get("/api/dev/latest-analysis").json()["analysis"]
+        self.assertEqual(dev["response"]["reused"]["from_analysis_id"], first["id"])
+
+    def test_resave_with_same_content_reuses_and_stays_current(self):
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        first, _ = self._run(rec["id"])
+        again = self.post_record(gratitude="庭のバラ", mood="元気").json()  # 同じ日の上書き（同じ内容）
+        self.assertIsNone(self.c.get("/api/today-word").json()["todays_word"])  # 上書き直後は解析前
+        second, calls = self._run(again["id"])
+        self.assertEqual(calls, [])
+        self.assertIn("reused", second["response"])
+        self.assertEqual(self.c.get("/api/today-word").json()["todays_word"], first["todays_word"])
+
+    def test_changed_content_calls_gemini_again(self):
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        self._run(rec["id"])
+        changed = self.post_record(gratitude="庭のバラ", mood="少し眠い").json()
+        a, calls = self._run(changed["id"])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("reused", a["response"])
+        # 写真を足しただけでも入力が変わる
+        self.post_record(gratitude="庭のバラ", mood="少し眠い", files={"photo": ("p.png", PNG, "image/png")})
+        a, calls = self._run(changed["id"])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("reused", a["response"])
+
+    def test_voice_transcript_is_part_of_identity(self):
+        audio = b"OggS" + b"0" * 200
+        ok = {"transcript": "孫から手紙が届いた", "todays_word": "「孫から手紙が届いた」一日。", "observations": []}
+        rec = self.post_record(files={"audio": ("memo.ogg", audio, "audio/ogg")}).json()
+        first, calls = self._run(rec["id"], {self.PRIMARY: [ok]})
+        self.assertEqual(len(calls), 1)
+        # 文字起こしが記録に書き込まれた後の内容で比べるので、次の再解析は再利用になる
+        second, calls = self._run(rec["id"], {self.PRIMARY: [ok]})
+        self.assertEqual(calls, [])
+        self.assertEqual(second["todays_word"], first["todays_word"])
+
+    def test_gemini_error_or_quota_result_is_retried(self):
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        a, _ = self._run(rec["id"], {self.PRIMARY: [E503], self.FALLBACK: [E503]})
+        self.assertEqual(a["fallback_reason"], "gemini_error")
+        a, calls = self._run(rec["id"])  # 前回は Gemini が応答していないので、もう一度呼ぶ
+        self.assertEqual((a["engine"], len(calls)), ("gemini", 1))
+
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "2"  # ここまでで2回使った
+        changed = self.post_record(gratitude="庭のバラ", mood="元気だよ").json()
+        a, _ = self._run(changed["id"])
+        self.assertEqual(a["fallback_reason"], "quota_user")
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "3"
+        a, calls = self._run(changed["id"])  # 回数上限のモックは再利用しない
+        self.assertEqual((a["engine"], len(calls)), ("gemini", 1))
+
+    def test_reuse_does_not_consume_quota(self):
+        os.environ["GEMINI_DAILY_LIMIT_PER_USER"] = "1"
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        self._run(rec["id"])
+        a, calls = self._run(rec["id"])
+        self.assertEqual(calls, [])
+        self.assertEqual(a["engine"], "gemini")
+        self.assertIn("reused", a["response"])
+
+    def test_guard_fallback_is_reused(self):
+        bad = {"todays_word": "「庭のバラ」の日。念のため病院に行ってみては。", "observations": []}
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        first, _ = self._run(rec["id"], {self.PRIMARY: [bad]})
+        self.assertEqual(first["fallback_reason"], "guard_ng_word")
+        second, calls = self._run(rec["id"])
+        self.assertEqual(calls, [])
+        self.assertEqual((second["fallback_reason"], second["todays_word"]),
+                         ("guard_ng_word", first["todays_word"]))
+
+    def test_mock_without_key_is_not_reused(self):
+        os.environ.pop("GEMINI_API_KEY")
+        rec = self.post_record(gratitude="庭のバラ", mood="元気").json()
+        self.c.post(f"/api/records/{rec['id']}/analyze")
+        a = self.c.post(f"/api/records/{rec['id']}/analyze").json()
+        self.assertNotIn("reused", a["response"])
 
 
 def tearDownModule():

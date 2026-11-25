@@ -108,6 +108,7 @@ class TestMySQLOffline(unittest.TestCase):
             st.toggle_stamp(1, "u2", "いいね")
             st.add_reply(1, "u2", "返信"); st.list_replies(1)
             st.get_reply(1); st.delete_reply(1); st.delete_share(1)
+            st.consume_gemini_quota("2026-11-22", "u1", 3, 100)
             st.reset_all()
 
         self.assertGreater(len(executed), 40)
@@ -223,6 +224,15 @@ class TestMySQLLive(unittest.TestCase):
         self.assertTrue(st.remove_family_link("u1", "u2"))
         self.assertFalse(st.remove_family_link("u1", "u2"))
         self.assertFalse(st.are_linked("u2", "u1"))
+
+        # 実 Gemini の回数（#34）：全体を先に判定し、超えたら何も増やさない
+        day = "2026-11-22"
+        self.assertIsNone(st.consume_gemini_quota(day, "u1", 2, 3))
+        self.assertIsNone(st.consume_gemini_quota(day, "u1", 2, 3))
+        self.assertEqual(st.consume_gemini_quota(day, "u1", 2, 3), "user")
+        self.assertIsNone(st.consume_gemini_quota(day, "u2", 2, 3))
+        self.assertEqual(st.consume_gemini_quota(day, "u3", 2, 3), "global")
+        self.assertIsNone(st.consume_gemini_quota("2026-11-23", "u1", 2, 3))
 
 
 if __name__ == "__main__":

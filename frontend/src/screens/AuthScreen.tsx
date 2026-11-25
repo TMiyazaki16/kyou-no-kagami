@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { api, Me } from "../api";
 import { errText } from "../lib/format";
 import { WaterBand } from "../components/WaterBand";
@@ -13,10 +13,21 @@ export function AuthScreen({ onAuthed }: { onAuthed: (token: string, user: Me) =
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // 本番（審査用）は新規登録を止めている。フォームは見せたまま、登録ボタンだけ押せなくする
+  const [registrationOpen, setRegistrationOpen] = useState(true);
+
+  useEffect(() => {
+    api
+      .health()
+      .then((h) => setRegistrationOpen(h.registration_enabled !== false))
+      .catch(() => undefined); // 読めないときは従来どおり（登録 API 側でも止めている）
+  }, []);
+  const registerClosed = mode === "register" && !registrationOpen;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    if (registerClosed) return;
     if (mode === "register" && password.length < 8) {
       setError("パスワードは8文字以上にしてください");
       return;
@@ -82,8 +93,9 @@ export function AuthScreen({ onAuthed }: { onAuthed: (token: string, user: Me) =
             onChange={(e) => setPassword(e.target.value)}
             required
           />
+          {registerClosed && <p className="notice">現在、新規登録は受け付けていません</p>}
           {error && <p className="error">{error}</p>}
-          <button className="primary big-btn" type="submit" disabled={busy}>
+          <button className="primary big-btn" type="submit" disabled={busy || registerClosed}>
             {busy ? "確認しています…" : mode === "login" ? "ログイン" : "登録してはじめる"}
           </button>
         </form>
