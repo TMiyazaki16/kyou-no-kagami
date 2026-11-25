@@ -32,6 +32,7 @@ FAMILY_CODE_LEN = 12
 DEMO_ACCOUNTS = [
     {"id": "mother", "email": "haha@demo.local", "password": "demo-mama-2026", "display_name": "母さん"},
     {"id": "daughter", "email": "musume@demo.local", "password": "demo-musume-2026", "display_name": "娘さん"},
+    {"id": "son", "email": "musuko@demo.local", "password": "demo-musuko-2026", "display_name": "息子さん"},
 ]
 
 
@@ -137,14 +138,20 @@ def create_account(store: Store, display_name: str, email: str, password: str,
 
 
 def ensure_demo_accounts(store: Store) -> list[dict]:
-    """デモアカウント（母さん・娘さん）を用意して連携する。既にあれば作り直さない（パスワードも変えない）。"""
+    """デモアカウント（母さん・娘さん・息子さん）を用意して、全員を互いに連携する。
+
+    既にあれば作り直さない（パスワードも変えない）。連携も既にあればそのまま（冪等）。
+    登録 API を通らないので REGISTRATION_ENABLED の影響は受けない。
+    """
     users = []
     for acc in DEMO_ACCOUNTS:
         user = store.get_user(acc["id"])
         if user is None:
             user = create_account(store, acc["display_name"], acc["email"], acc["password"], user_id=acc["id"])
         users.append(user)
-    store.add_family_link(users[0]["id"], users[1]["id"])
+    for i, a in enumerate(users):
+        for b in users[i + 1:]:
+            store.add_family_link(a["id"], b["id"])
     return users
 
 

@@ -73,11 +73,12 @@ frontend/src/
 |---|---|---|---|
 | 母さん | `haha@demo.local` | `demo-mama-2026` | `mother` |
 | 娘さん | `musume@demo.local` | `demo-musume-2026` | `daughter` |
+| 息子さん | `musuko@demo.local` | `demo-musuko-2026` | `son` |
 
 - デモ用に公開している認証情報。本番のDBには作らない
-- ID を旧固定ユーザーと同じ `mother` / `daughter` にしているので、旧データ（記録・解析・共有・スタンプ）は行を書き換えずにそのまま引き継がれる
+- 母さん・娘さんの ID を旧固定ユーザーと同じ `mother` / `daughter` にしているので、旧データ（記録・解析・共有・スタンプ）は行を書き換えずにそのまま引き継がれる
 - 起動時（`main.py` の import 時）に `auth.migrate_legacy_users` が、`mother` / `daughter` のデータがあってアカウントがないときだけデモアカウントを作り、連携する。旧データのない新しいDBでは何もしない
-- `seed_demo.py` は `auth.ensure_demo_accounts` で2アカウントを作って連携してから投入する
+- `seed_demo.py` は `auth.ensure_demo_accounts` で3アカウントを作り、3組すべて（母⇔娘・母⇔息子・娘⇔息子）を連携してから投入する。登録 API を通らないので `REGISTRATION_ENABLED=false` でも動く（#39）。父のアカウントは作らない（「離れて暮らす家族」の前提をぼかさないため。2026-11-24 オーナー決定）
 
 - `storage.py` — 永続化はすべて `Store` を経由する。実装の選択は `storage.create_store()`（`DB_BACKEND=mysql` → `MySQLStore`、それ以外 → `SQLiteStore`）。Store にメソッドを足すときは `SQLiteStore` と `MySQLStore` の両方に実装する（`test_mysql_store` がメソッドの一致を検査する）。`main.py` から SQL を直接書かない。アカウント・セッション・家族連携も `Store` のメソッド（`create_user` / `create_session` / `add_family_link` など）を通す。記録は1ユーザー1日1件で、同じ日の2回目は `upsert_record` で上書きする。既存DBに足りない列は起動時に `ALTER TABLE` で追加する（analyses は `_ANALYSIS_EXTRA_COLUMNS`、shares は `_SHARE_EXTRA_COLUMNS`。MySQL は `storage_mysql._MYSQL_ANALYSIS_EXTRA_COLUMNS` / `_MYSQL_SHARE_EXTRA_COLUMNS` にも足す）
 - `storage_mysql.py` — MySQL の方言：プレースホルダは `%s`（SQL にリテラルの `%` を書かない）、`BIGINT AUTO_INCREMENT`、索引・一意の列は VARCHAR、TEXT にリテラル DEFAULT を付けない（値はアプリが渡す）、`utf8mb4` / `utf8mb4_bin`（SQLite と同じバイナリ照合）。日時は DATETIME にせずタイムゾーン付き ISO 文字列（`main._parse_ts` が前提にしている）。記録は `(user_id, date)` に UNIQUE を付けて `INSERT ... ON DUPLICATE KEY UPDATE` で upsert。重複判定は INSERT IGNORE ではなくエラー 1062 を捕まえる。スキーマは `CREATE TABLE IF NOT EXISTS` で冪等。接続情報（特にパスワード）をログ・例外メッセージ・repr に出さない
@@ -85,7 +86,7 @@ frontend/src/
 - `analysis.py` — `GEMINI_API_KEY` があれば Gemini、なければ決定的なモック。呼び出しは主モデル → 代替モデル（`GEMINI_FALLBACK_MODEL`）→ モックの順で、一次的エラー（503・429・5xx・タイムアウト）だけ各モデル最大2回まで指数バックオフ（1s→2s）で再試行する（待ちは `analysis._sleep` を通すので、テストは差し替えて実時間で眠らない）。全滅したらモックに落とし、理由を `fallback_reason`（`no_api_key` / `gemini_error` / `quota_*` / `guard_*`）に残す。「仕組みを見る」画面がこれを表示する。Gemini の出力はそのまま使わず、`_apply_guards` で検査する：NG語、引用チェック、ベースライン中の変化への言及（引用部分を除いて検査）、ベースライン中の観察文差し替え、定型文の付与、疲れ・体調の断定調（`guard_assertive`）、外見へのコメント（`guard_appearance`、写真の有無によらず）。写真があれば音声と同じく `inline_data` で渡し（各試行とも）、写真を受け付けない恒常的エラーでは写真だけ外して続行する。モックは写真の中身に触れず「写真が届いた」とだけ書く。観察候補（`observation_candidates`、最大3件）は Gemini が提案し、`evaluate_candidates` が候補ごとに採否を決める（引用の実在・NG語・外見・断定調・ベースライン・ルールとの重複。採用分はルール観察の後ろ、`care_context` には関わらない、モックは候補を出さない）。ガードを緩める変更は、審査で「AIは診断しない」を説明できなくなるので相談する
 - 本番向けガード（#34）— 実 Gemini の回数は `main._gemini_quota` が `analysis.analyze(quota=...)` に渡し、Gemini を呼ぶ直前に1回だけ `Store.consume_gemini_quota`（`gemini_usage` 表）で枠を取る（連鎖・再試行はまとめて1回）。再解析は `main.run_analysis` が `request.input_fingerprint`（回答・文字起こし・声・写真の SHA-256）を前回と比べ、同じで前回 Gemini が応答していれば（`fallback_reason` が空か `guard_*`）Gemini を呼ばずに結果を写して保存し直す（`response.reused`）。どちらも Gemini キーがあるときだけ働く
 - `rules.py` — Python だけで書いた3ルール（回答が短い日が続く／感謝欄が空の日／「眠い」等のことばが続く）。出力は判定ではなく観察文。病名や助言は書かず、配慮が必要な文脈では `care_context=True` を返すだけにする（定型文は `analysis.py` が付ける）
-- `scripts/seed_demo.py` — デモアカウント（母さん・娘さん、連携済み）を作り、10日分を、最終日（既定は JST の今日）からさかのぼって投入する。母は1〜7日目が安定、8〜10日目は「元気だけど眠い」で回答が短くなる。9日目に2ルール、10日目に3ルールが発動する。解析はモックで行う。`--with-letter` の便りは7日目のフィードバックの引用＋母のコメントで、`Store.create_letters` で作る
+- `scripts/seed_demo.py` — デモアカウント（母さん・娘さん・息子さん、互いに連携済み）を作り、10日分を、最終日（既定は JST の今日）からさかのぼって投入する。母は1〜7日目が安定、8〜10日目は「元気だけど眠い」で回答が短くなる。9日目に2ルール、10日目に3ルールが発動する。娘・息子は安定型で発動しない（息子の文は `rules.WATCH_WORDS` を使わない）。解析はモックで行う。`--with-letter` の便りは新形式（その日のフィードバックの引用＋コメント、`Store.create_letters`）で、母→娘（7日目。娘のスタンプ「うれしい」と返信が1件ずつ付き、母のベルにバッジが出る）と息子→母（5日目）の2通
 
 ## 開発コマンド
 
@@ -99,7 +100,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 初回の
 
 # デモデータ（--reset は data/app.db を削除して作り直す）
 .venv/bin/python scripts/seed_demo.py --reset                 # デモアカウント2つ（連携済み）＋10日分
-.venv/bin/python scripts/seed_demo.py --reset --with-letter   # 母→娘の送信済み便りも1通
+.venv/bin/python scripts/seed_demo.py --reset --with-letter   # 便り2通（母→娘・息子→母）と娘の反応も
 .venv/bin/python scripts/seed_demo.py --reset --leave-today   # 今日の母の記録はデモでその場で入力する
 .venv/bin/python scripts/seed_demo.py --db /tmp/demo.db --reset --end-date 2026-11-29   # 別DB・日付指定
 
@@ -239,7 +240,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
 | 検証スキル | `verify-app` |
 | テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
-| テストの期待値 | `Ran 178 tests` / `OK (skipped=1)`（2026-11-25 時点。skip は MySQL 実機検査）。テストを足したら更新する |
+| テストの期待値 | `Ran 179 tests` / `OK (skipped=1)`（2026-11-25 時点、#39 後。skip は MySQL 実機検査）。テストを足したら更新する |
 | ビルド | `cd frontend && npm run build` |
 | 画面確認用 Python | `playwright` が入った Python（アプリの依存ではない。無ければ `verify-app` の 3-1 で別 venv を作る） |
 | 不変条件 | このファイルの「仕様の不変条件」 |

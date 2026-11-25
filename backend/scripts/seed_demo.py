@@ -3,22 +3,29 @@
 企画のデモシナリオ:
   母: 1〜7日目は安定（感謝も気分もしっかり書く）
       8〜10日目は「元気」と言いつつ「眠い」が続き、回答が短くなる（9・10日目は感謝欄が空）
-  娘: 同じ期間、毎日記録する
+  娘: 同じ期間、毎日記録する（変化なし）
+  息子: 同じ期間、毎日記録する（安定型。文量が安定し、要注意のことばも感謝の空欄もないのでルールは発動しない）
 
-記録はデモアカウント（連携済み）に入ります:
-  母さん  haha@demo.local   / demo-mama-2026    （ID: mother）
-  娘さん  musume@demo.local / demo-musume-2026  （ID: daughter）
+記録はデモアカウント（3人とも互いに連携済み）に入ります:
+  母さん    haha@demo.local   / demo-mama-2026    （ID: mother）
+  娘さん    musume@demo.local / demo-musume-2026  （ID: daughter）
+  息子さん  musuko@demo.local / demo-musuko-2026  （ID: son）
 ※ デモ用の公開された認証情報です。本番のDBには投入しないでください。
 
 最終日（既定では JST の今日）が DAYS 日目になるように、過去にさかのぼって投入します。
 解析は決定的なローカルモックで行います（GEMINI_API_KEY は投入中だけ無効化）。
 最終日の母の記録だけ投入しない `--leave-today` を付けると、デモで「今日の記録」をその場で
 入力して8日目以降の観察が出る様子を見せられます。
+アカウントは登録 API を通さず Store に直接作るので、REGISTRATION_ENABLED=false でも投入できます。
 
 使い方（backend ディレクトリで）:
   .venv/bin/python scripts/seed_demo.py --reset            # data/app.db を作り直して投入
   .venv/bin/python scripts/seed_demo.py --db /tmp/demo.db   # 別のDBに投入
-  .venv/bin/python scripts/seed_demo.py --reset --with-letter  # 母→娘の送信済み便りも1通入れる
+  .venv/bin/python scripts/seed_demo.py --reset --with-letter  # 便りも入れる（下記）
+
+--with-letter の便り（どれも「その日のフィードバックの引用＋本人のコメント」の新形式）:
+  母→娘（7日目）。娘からのスタンプ「うれしい」と返信が1件ずつ付く（母のベルにバッジが出る）
+  息子→母（5日目）
 
 MySQL（DB_BACKEND=mysql、接続は MYSQL_* 環境変数）でも Store 経由で同じように投入する。
 MySQL の --reset は全テーブルを空にするので、--confirm-mysql-reset <MYSQL_DATABASE の値> が必要:
@@ -63,6 +70,49 @@ DAUGHTER = [
     ("夫が夕飯を作ってくれたこと", "ゆっくりできて気分がいい"),
 ]
 
+SON = [
+    # 安定型：毎日同じくらいの文量。要注意のことば（rules.WATCH_WORDS）は使わず、感謝も毎日書く
+    ("駅前のパン屋で焼きたてのクロワッサンが買えたこと", "朝から調子がよく、仕事もはかどった"),
+    ("先輩が企画書にていねいな助言をくれたこと", "気持ちが前向きで、体の調子もいい"),
+    ("ベランダのバジルに新しい葉が増えていたこと", "ゆったりした一日で、気分はおだやか"),
+    ("昼休みに同期と近くの定食屋で話せたこと", "いつもどおり元気で、食欲もある"),
+    ("母さんから庭のバラの写真が届いたこと", "懐かしい気持ちになって、心が温かい"),
+    ("週末のフットサルでゴールを決められたこと", "よく動いて汗をかき、すっきりした"),
+    ("近所の銭湯でゆっくり湯船につかれたこと", "体がほぐれて、気分も晴れやかです"),
+    ("姉ちゃんが子どもの動画を送ってくれたこと", "思わず笑って、元気をもらえた一日"),
+    ("取引先との打ち合わせがうまくまとまったこと", "仕事が順調で、気持ちに余裕がある"),
+    ("帰り道に見た月がとてもきれいだったこと", "落ち着いた一日で、体の調子も上々"),
+]
+
+# --with-letter で入れる便り・反応（コメント・返信は本人が書いた体の文）
+MOTHER_LETTER_DAY = 7
+MOTHER_LETTER_COMMENT = "友だちと電話で昔話をして、たくさん笑ったよ。"
+DAUGHTER_STAMP = "うれしい"
+DAUGHTER_REPLY = "お母さんの笑い声が聞こえてきそう。週末に電話するね。"
+SON_LETTER_DAY = 5
+SON_LETTER_COMMENT = "母さんのバラの写真、デスクで見てるよ。"
+
+PEOPLE = (("mother", MOTHER, 8), ("daughter", DAUGHTER, 21), ("son", SON, 22))
+
+
+def _send_letter(app_main, store, from_user: str, to_user: str, start: date, day: int,
+                 comment: str, hour: int) -> dict | None:
+    """day 日目の記録のフィードバックを引用して、from_user → to_user の送信済み便りを1通作る。"""
+    d = start + timedelta(days=day - 1)
+    rec = store.find_record(from_user, d.isoformat())
+    feedback = app_main._feedback_snapshot(rec) if rec else None
+    if not feedback:
+        print(f"便りを作れませんでした（{from_user} の {day}日目に引用できる一言がありません）", file=sys.stderr)
+        return None
+    sent_at = min(datetime.combine(d, time(hour, 0), tzinfo=app_main.JST), datetime.now(app_main.JST))
+    letters = store.create_letters(from_user, rec["id"], [to_user], {
+        "snapshot_json": json.dumps(feedback, ensure_ascii=False),
+        "comment": comment,
+        "photo_path": None,
+        "sent_at": sent_at.isoformat(),
+    })
+    return letters[0]
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="きょうのかがみのデモデータを投入します")
@@ -103,10 +153,10 @@ def main() -> int:
     target = store.describe() if use_mysql else db_path  # type: ignore[attr-defined]
     if use_mysql and args.reset:
         store.reset_all()  # type: ignore[attr-defined]
-    if not args.reset and any(store.list_records(u) for u in ("mother", "daughter")):
+    if not args.reset and any(store.list_records(a["id"]) for a in auth.DEMO_ACCOUNTS):
         print(f"既に記録があります: {target}\n作り直す場合は --reset を付けてください。", file=sys.stderr)
         return 1
-    auth.ensure_demo_accounts(store)  # 母さん・娘さんを作って連携済みにする
+    auth.ensure_demo_accounts(store)  # 母さん・娘さん・息子さんを作って、全員を互いに連携する
 
     end = date.fromisoformat(args.end_date) if args.end_date else app_main.today_jst()
     n = len(MOTHER)
@@ -114,7 +164,7 @@ def main() -> int:
 
     for i in range(n):
         d = start + timedelta(days=i)
-        for user_id, data, hour in (("mother", MOTHER, 8), ("daughter", DAUGHTER, 21)):
+        for user_id, data, hour in PEOPLE:
             if user_id == "mother" and args.leave_today and i == n - 1:
                 continue
             gratitude, mood = data[i]
@@ -131,17 +181,14 @@ def main() -> int:
                 print(f"{d} 母 {i + 1:>2}日目  観察ルール: {len(extra)}件" + (f"  {extra}" if extra else ""))
 
     if args.with_letter:
-        rec7 = store.find_record("mother", (start + timedelta(days=6)).isoformat())
         # 便りは「その日のフィードバックの引用（送信時点で固定）＋本人のコメント」（API の POST /api/shares と同じ形）
-        feedback = app_main._feedback_snapshot(rec7) if rec7 else None
-        if feedback:
-            store.create_letters("mother", rec7["id"], ["daughter"], {
-                "snapshot_json": json.dumps(feedback, ensure_ascii=False),
-                "comment": "友だちと電話で昔話をして、たくさん笑ったよ。",
-                "photo_path": None,
-                "sent_at": datetime.combine(start + timedelta(days=6), time(20, 0),
-                                            tzinfo=app_main.JST).isoformat(),
-            })
+        letter = _send_letter(app_main, store, "mother", "daughter", start, MOTHER_LETTER_DAY,
+                              MOTHER_LETTER_COMMENT, hour=20)
+        if letter:
+            # 娘からの反応（スタンプ＋返信）。母でログインするとベルのバッジと通知パネルに出る
+            store.toggle_stamp(letter["id"], "daughter", DAUGHTER_STAMP)
+            store.add_reply(letter["id"], "daughter", DAUGHTER_REPLY)
+        _send_letter(app_main, store, "son", "mother", start, SON_LETTER_DAY, SON_LETTER_COMMENT, hour=22)
 
     print(f"\n投入しました: {target}（{start} 〜 {end}、{n}日分）")
     for acc in auth.DEMO_ACCOUNTS:

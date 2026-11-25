@@ -25,7 +25,7 @@ sys.path.insert(0, BACKEND_DIR)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import analysis, auth, main  # noqa: E402
+from app import analysis, auth, main, rules  # noqa: E402
 from app.storage import SQLiteStore  # noqa: E402
 
 TODAY = date(2026, 11, 22)
@@ -1953,7 +1953,8 @@ class TestChangeRulesAndSeed(Base):
 
     def test_seed_demo_script_and_rules_fire_after_day8(self):
         db = os.path.join(self.dir, "seed.db")
-        env = {**os.environ, "APP_UPLOAD_DIR": os.path.join(self.dir, "up")}
+        # 本番と同じく新規登録を止めていても、seed は登録 API を通らないので投入できる（#39）
+        env = {**os.environ, "APP_UPLOAD_DIR": os.path.join(self.dir, "up"), "REGISTRATION_ENABLED": "false"}
         env.pop("GEMINI_API_KEY", None)
         p = subprocess.run(
             [sys.executable, os.path.join(BACKEND_DIR, "scripts", "seed_demo.py"),
@@ -1997,7 +1998,7 @@ class TestChangeRulesAndSeed(Base):
         me = mom.get("/api/me").json()
         self.assertEqual(me["user"]["display_name"], "母さん")
         self.assertEqual(me["user"]["id"], "mother")
-        self.assertEqual([f["display_name"] for f in me["family"]], ["娘さん"])  # 連携済み
+        self.assertEqual(sorted(f["display_name"] for f in me["family"]), ["娘さん", "息子さん"])  # 連携済み
         self.assertEqual(len(mom.get("/api/records").json()), 10)
         self.assertEqual(len(dau.get("/api/records").json()), 10)
         # 今日（10日目）の観察として見える
@@ -2011,11 +2012,65 @@ class TestChangeRulesAndSeed(Base):
         received = dau.get("/api/letters").json()["received"]
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["from_name"], "母さん")
+        self.assertNotIn("demo-musuko-2026", p.stdout + p.stderr)
+        self.seed_three_people_checks(mom, dau, mother, daughter)
         # 間違ったパスワードでは入れない
         r = self.anon.post("/api/auth/login", json={"email": "haha@demo.local", "password": "wrong-pass"})
         self.assertEqual(r.status_code, 401)
         # 出力にパスワードを出さない
         self.assertNotIn("demo-mama-2026", p.stdout + p.stderr)
+
+    def seed_three_people_checks(self, mom, dau, mother, daughter):
+        """#39：息子さんのアカウント・3人の相互連携・息子の安定シナリオ・新形式の便り2通と母宛の反応。"""
+        son_c = self.login_client("musuko@demo.local", "demo-musuko-2026")
+        son_me = son_c.get("/api/me").json()
+        self.assertEqual((son_me["user"]["id"], son_me["user"]["display_name"]), ("son", "息子さん"))
+        # 3組すべて連携済み
+        for a, b in (("mother", "daughter"), ("mother", "son"), ("daughter", "son")):
+            self.assertTrue(self.store.are_linked(a, b), (a, b))
+        self.assertEqual(sorted(f["id"] for f in son_me["family"]), ["daughter", "mother"])
+        self.assertEqual(sorted(f["id"] for f in dau.get("/api/me").json()["family"]), ["mother", "son"])
+
+        # 息子は10日分、どの日もルールが発動しない（安定型）。母・娘のシナリオは変えない
+        son = sorted(self.store.list_records("son"), key=lambda r: r["date"])
+        self.assertEqual(len(son), 10)
+        self.assertEqual(len(son_c.get("/api/records").json()), 10)
+        for n in range(1, 11):
+            self.assertEqual(rules.evaluate(son[:n])["fired"], [], f"son day {n}")
+            ana = self.store.analysis_for_record(son[n - 1]["id"])
+            self.assertEqual(ana["baseline_day"], n)
+            self.assertNotIn(analysis.FIXED_CARE_PHRASE, ana["observations"])
+        self.assertEqual(rules.evaluate(daughter)["fired"], [])
+        self.assertEqual(len(rules.evaluate(mother[:9])["fired"]), 2)
+        self.assertEqual(len(rules.evaluate(mother[:10])["fired"]), 3)
+
+        # 便りは2通とも新形式（引用スナップショット＋コメント）
+        letters = [l for u in ("mother", "daughter", "son") for l in self.store.list_letters_sent_by(u)]
+        self.assertEqual(sorted((l["from_user"], l["to_user"]) for l in letters),
+                         [("mother", "daughter"), ("son", "mother")])
+        for l in letters:
+            snap = json.loads(l["snapshot_json"])
+            self.assertTrue(snap["todays_word"].startswith("「"), snap)
+            self.assertTrue(l["comment"])
+            rec = self.store.get_record(l["record_id"])
+            self.assertEqual((rec["user_id"], rec["date"]), (l["from_user"], snap["date"]))
+            self.assertEqual(snap["todays_word"], self.store.analysis_for_record(rec["id"])["todays_word"])
+        # 息子→母は母に届き、引用は息子のその日の言葉
+        got = mom.get("/api/letters").json()
+        self.assertEqual([(l["from_name"], l["comment"]) for l in got["received"]],
+                         [("息子さん", "母さんのバラの写真、デスクで見てるよ。")])
+        self.assertIn("母さんから庭のバラの写真が届いたこと", got["received"][0]["feedback"]["todays_word"])
+        self.assertEqual(son_c.get("/api/letters").json()["sent"][0]["to_name"], "母さん")
+        # 母の送った便り（母→娘）に、娘からのスタンプ1件と返信1件（母のベル・通知パネルに出る）
+        sent = got["sent"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual([(s["from_user"], s["stamp"]) for s in sent[0]["stamps"]], [("daughter", "うれしい")])
+        self.assertEqual([r["from_user"] for r in sent[0]["replies"]], ["daughter"])
+        self.assertLessEqual(len(sent[0]["replies"][0]["body"]), 200)
+        self.assertGreater(main._parse_ts(sent[0]["replies"][0]["created_at"]), main._parse_ts(sent[0]["sent_at"]))
+        # 息子と娘の送った便りへの反応は入れない（反応は母宛の1件ずつだけ）
+        self.assertEqual(dau.get("/api/letters").json()["sent"], [])
+        self.assertEqual(son_c.get("/api/letters").json()["sent"][0]["stamps"], [])
 
     def login_client(self, email, password):
         r = self.anon.post("/api/auth/login", json={"email": email, "password": password})
@@ -2197,6 +2252,20 @@ class TestFamily(Base):
         self.assertEqual(self.c.post("/api/family/link", json={"code": "AAAA-AAAA-AAAA"}).status_code, 404)
         self.assertEqual(self.c.post("/api/family/link", json={"code": ""}).status_code, 404)
         self.assertEqual(self.c.delete("/api/family/links/nobody").status_code, 404)
+
+    def test_ensure_demo_accounts_three_people_linked_and_idempotent(self):
+        # #39：母さん・娘さん・息子さんを作り、3組すべてを連携する。2回目は作り直さない（家族コードも変わらない）
+        fresh = SQLiteStore(os.path.join(self.dir, "demo.db"))
+        os.environ["REGISTRATION_ENABLED"] = "false"  # 登録 API を通らないので影響しない
+        first = auth.ensure_demo_accounts(fresh)
+        self.assertEqual([(u["id"], u["display_name"]) for u in first],
+                         [("mother", "母さん"), ("daughter", "娘さん"), ("son", "息子さん")])
+        self.assertEqual(fresh.find_user_by_email("musuko@demo.local")["id"], "son")
+        second = auth.ensure_demo_accounts(fresh)
+        self.assertEqual([u["family_code"] for u in first], [u["family_code"] for u in second])
+        for uid, others in (("mother", ["daughter", "son"]), ("daughter", ["mother", "son"]),
+                            ("son", ["daughter", "mother"])):
+            self.assertEqual(sorted(f["id"] for f in fresh.list_family(uid)), others)
 
     def test_family_codes_are_unique_and_random(self):
         codes = {auth.new_family_code() for _ in range(200)}
