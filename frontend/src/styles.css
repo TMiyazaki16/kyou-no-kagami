@@ -219,6 +219,28 @@ h3 {
 .card > button + p, .card > button + .muted { margin-top: var(--space-3); }
 .card > p + button, .card > .row + p { margin-top: var(--space-2); }
 
+/* カードの見出し行と右上の「⋯」メニュー（記録一覧）。ボタンは 44px 四方、カードの角に寄せる */
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
+.card-head > h3 { min-width: 0; }
+.card-menu { position: relative; flex: none; margin: -10px -10px 0 0; }
+.card-menu-btn {
+  width: 44px; height: 44px; min-height: 44px; padding: 0;
+  border: 0; border-radius: var(--radius-pill); background: transparent; color: var(--muted);
+}
+.card-menu-btn:hover, .card-menu-btn[aria-expanded="true"] { background: var(--mizu); color: var(--deep); }
+.card-menu-list {
+  position: absolute; top: calc(100% + var(--space-1)); right: 0; z-index: 10;
+  min-width: 13em; margin: 0; padding: var(--space-1); list-style: none;
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-s); box-shadow: var(--shadow-lift);
+}
+.card-menu-list li + li { margin-top: 0; }
+.card-menu-list button {
+  width: 100%; min-height: var(--btn-h-sub); justify-content: flex-start;
+  border: 0; border-radius: var(--radius-s); background: transparent; color: var(--ink);
+  padding: 10px var(--space-3); font-weight: 600; white-space: nowrap;
+}
+.card-menu-list button:hover { background: var(--page); }
+
 /* 淡い水色の帯：本人だけのもの・AIの下書き・選択中（左に藍鼠の縁） */
 .notice {
   background: var(--mizu); border-left: 6px solid var(--indigo); border-radius: var(--radius-s);

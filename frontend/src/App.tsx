@@ -32,6 +32,9 @@ export default function App() {
   // Letters が受け取ったらすぐ消すので、日記を離れて戻っても出ない（永続化しない）
   const [diaryFocus, setDiaryFocus] = useState<DiaryFocus | null>(null);
   const clearFocus = useCallback(() => setDiaryFocus(null), []);
+  // 家族への共有で最初に選ぶ記録（記録一覧の「⋯」から開いたとき）。ShareConfirm が受け取ったらすぐ消す
+  const [shareRecordId, setShareRecordId] = useState<number | null>(null);
+  const clearShareRecord = useCallback(() => setShareRecordId(null), []);
   const bellWrap = useRef<HTMLSpanElement>(null);
   const closePanel = useCallback(() => {
     setPanelOpen(false);
@@ -131,7 +134,11 @@ export default function App() {
     setDiaryFocus(focus);
     go("letters");
   };
-  const ctx: Ctx = { me, family, go, openDiary, refreshMe };
+  const openShare = (recordId: number) => {
+    setShareRecordId(recordId);
+    go("share");
+  };
+  const ctx: Ctx = { me, family, go, openDiary, openShare, refreshMe };
 
   // ベル：パネルを開いた時点で、いま見えている反応を既読にしてバッジを消す（この端末の localStorage だけ）
   const openPanel = () => {
@@ -169,9 +176,11 @@ export default function App() {
         {screen === "home" && <Home {...ctx} />}
         {screen === "record" && <RecordScreen {...ctx} />}
         {screen === "today" && <TodayWord {...ctx} />}
-        {screen === "list" && <RecordList />}
+        {screen === "list" && <RecordList {...ctx} />}
         {screen === "reflect" && <Reflect />}
-        {screen === "share" && <ShareConfirm {...ctx} />}
+        {screen === "share" && (
+          <ShareConfirm {...ctx} initialRecordId={shareRecordId} onInitialUsed={clearShareRecord} />
+        )}
         {screen === "letters" && (
           <Letters {...ctx} onSeen={clearBadge} focus={diaryFocus} onFocused={clearFocus} />
         )}
