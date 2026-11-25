@@ -134,6 +134,7 @@ jobs:
       UPLOADS_BUCKET: ${{ vars.UPLOADS_BUCKET }}
       GEMINI_API_KEY_SECRET: ${{ vars.GEMINI_API_KEY_SECRET }}
       GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      REGISTRATION_ENABLED: ${{ vars.REGISTRATION_ENABLED }}
     steps:
       - uses: actions/checkout@v5
 
@@ -169,6 +170,7 @@ jobs:
           # --set-env-vars は既存の設定を置きかえる（ワークフローの内容が常に正）
           ENV_VARS="DB_BACKEND=mysql,MYSQL_HOST=/cloudsql/${CLOUDSQL_CONNECTION_NAME},MYSQL_USER=${MYSQL_USER},MYSQL_DATABASE=${MYSQL_DATABASE},UPLOAD_BACKEND=gcs,GCS_UPLOAD_BUCKET=${UPLOADS_BUCKET}"
           [ -n "$GEMINI_MODEL" ] && ENV_VARS="${ENV_VARS},GEMINI_MODEL=${GEMINI_MODEL}"
+          [ -n "$REGISTRATION_ENABLED" ] && ENV_VARS="${ENV_VARS},REGISTRATION_ENABLED=${REGISTRATION_ENABLED}"
           # シークレットの紐付けは Terraform がサービス側で管理する。
           # --set-secrets を付けると gcloud が Terraform 作成サービスの参照形式で
           # クラッシュするため、ここでは指定しない（2026-11-22 の初回デプロイで確認）。
