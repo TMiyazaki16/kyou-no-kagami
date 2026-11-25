@@ -264,7 +264,7 @@ class TestRecordsWithGCS(Base):
     def test_analysis_reads_audio_from_bucket(self):
         captured = {}
 
-        def fake_analyze(rec, baseline_day, previous, history, audio, photo=None):
+        def fake_analyze(rec, baseline_day, previous, history, audio, photo=None, quota=None):
             captured["audio"], captured["photo"] = audio, photo
             return {"todays_word": None, "observations": [], "engine": "mock", "request": {},
                     "response": {}, "kind": "voice_notice", "notice": "n", "fallback_reason": "no_api_key"}

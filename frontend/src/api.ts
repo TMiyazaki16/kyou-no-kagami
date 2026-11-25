@@ -16,6 +16,14 @@ export interface MeResponse {
   family: FamilyMember[];
 }
 
+/** /api/health（未ログインでも読める） */
+export interface Health {
+  status: string;
+  today: string;
+  /** false なら新規登録を受け付けていない（REGISTRATION_ENABLED） */
+  registration_enabled: boolean;
+}
+
 export interface AuthResponse {
   token: string;
   user: Me;
@@ -46,7 +54,7 @@ export interface Analysis {
   todays_word: string | null;
   kind: WordKind;
   notice: string;
-  /** "" | "no_api_key" | "gemini_error" | "guard_ng_word" | "guard_appearance" | "guard_no_quote" | "guard_baseline_change" | "guard_assertive" */
+  /** "" | "no_api_key" | "gemini_error" | "quota_user" | "quota_global" | "guard_ng_word" | "guard_appearance" | "guard_no_quote" | "guard_baseline_change" | "guard_assertive" */
   fallback_reason: string;
   observations: string[];
   engine: string;
@@ -210,6 +218,7 @@ const send = <T>(url: string, body: unknown, method = "POST") =>
 const del = <T>(url: string) => authFetch(url, { method: "DELETE" }).then((r) => json<T>(r));
 
 export const api = {
+  health: () => get<Health>("/api/health"),
   register: (displayName: string, email: string, password: string) =>
     send<AuthResponse>("/api/auth/register", { display_name: displayName, email, password }),
   login: (email: string, password: string) => send<AuthResponse>("/api/auth/login", { email, password }),

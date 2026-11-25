@@ -29,7 +29,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from .storage import AlreadySentError, DuplicateError, Store, _analysis_row, _now
+from .storage import GEMINI_SCOPE_GLOBAL, AlreadySentError, DuplicateError, Store, _analysis_row, _now, gemini_user_scope
 
 _ER_DUP_ENTRY = 1062
 _TABLE_OPTS = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
@@ -121,6 +121,13 @@ MYSQL_SCHEMA = [
     PRIMARY KEY (user_a, user_b),
     KEY idx_family_links_b (user_b)
 ) {_TABLE_OPTS}""",
+    f"""CREATE TABLE IF NOT EXISTS gemini_usage (
+    day CHAR(10) NOT NULL,
+    scope VARCHAR(80) NOT NULL,
+    calls INT NOT NULL DEFAULT 0,
+    updated_at VARCHAR(40) NOT NULL,
+    PRIMARY KEY (day, scope)
+) {_TABLE_OPTS}""",
 ]
 
 # 既存DBへの後方互換マイグレーション（storage._ANALYSIS_EXTRA_COLUMNS の MySQL 版）。
@@ -138,7 +145,8 @@ _MYSQL_SHARE_EXTRA_COLUMNS = {
     "comment": "TEXT NULL",               # TEXT にリテラル DEFAULT を付けられないので NULL 可（アプリが必ず渡す）
 }
 
-APP_TABLES = ("letter_replies", "stamps", "shares", "analyses", "records", "family_links", "sessions", "users")
+APP_TABLES = ("letter_replies", "stamps", "shares", "analyses", "records", "family_links", "sessions", "users",
+              "gemini_usage")
 
 
 def mysql_settings_from_env() -> dict[str, Any]:
@@ -240,7 +248,7 @@ class MySQLStore(Store):
             for t in APP_TABLES:
                 cur.execute(f"DELETE FROM {t}")
             for t in APP_TABLES:
-                if t not in ("family_links", "sessions", "users"):
+                if t not in ("family_links", "sessions", "users", "gemini_usage"):
                     cur.execute(f"ALTER TABLE {t} AUTO_INCREMENT = 1")
 
     def _is_dup(self, e: Exception) -> bool:
@@ -554,3 +562,32 @@ class MySQLStore(Store):
     def delete_reply(self, reply_id: int) -> bool:
         with self._conn() as cur:
             return bool(cur.execute("DELETE FROM letter_replies WHERE id = %s", (reply_id,)))
+
+    # ---- gemini usage ----------------------------------------------------
+    def consume_gemini_quota(self, day: str, user_id: str, user_limit: int, global_limit: int) -> str | None:
+        """Cloud Run の複数インスタンスから同時に数えても超えないよう、行ロック（FOR UPDATE）の中で判定する。"""
+        user_scope = gemini_user_scope(user_id)
+        now = _now()
+        with self._conn() as cur:
+            # 行を先に作ってからロックする（無い行は FOR UPDATE で押さえられないため）。順序は scope の昇順で固定
+            for scope in sorted((GEMINI_SCOPE_GLOBAL, user_scope)):
+                cur.execute(
+                    "INSERT INTO gemini_usage (day, scope, calls, updated_at) VALUES (%s, %s, 0, %s)"
+                    " ON DUPLICATE KEY UPDATE calls = calls",
+                    (day, scope, now),
+                )
+            cur.execute(
+                "SELECT scope, calls FROM gemini_usage WHERE day = %s AND scope IN (%s, %s)"
+                " ORDER BY scope FOR UPDATE",
+                (day, GEMINI_SCOPE_GLOBAL, user_scope),
+            )
+            used = {r["scope"]: int(r["calls"]) for r in cur.fetchall()}
+            if used.get(GEMINI_SCOPE_GLOBAL, 0) >= global_limit:
+                return "global"
+            if used.get(user_scope, 0) >= user_limit:
+                return "user"
+            cur.execute(
+                "UPDATE gemini_usage SET calls = calls + 1, updated_at = %s WHERE day = %s AND scope IN (%s, %s)",
+                (now, day, GEMINI_SCOPE_GLOBAL, user_scope),
+            )
+        return None
