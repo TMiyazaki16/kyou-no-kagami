@@ -24,7 +24,7 @@ env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v
 
 - 期待値は `<テストの期待値>`（2026-11-23 時点：`Ran 68 tests` / `OK (skipped=1)`。skip は MySQL 実機検査で、`KAGAMI_TEST_MYSQL` 未設定のため）
 - テストを足した PR では件数が増える。増減した件数と理由を報告する。失敗・エラーが 1 件でもあれば検品は不合格
-- MySQL 実機検査（`KAGAMI_TEST_MYSQL=1`）は検証専用 DB の全テーブルを空にするので、Deroshi の指示があるときだけ行う
+- MySQL 実機検査（`KAGAMI_TEST_MYSQL=1`）は検証専用 DB の全テーブルを空にするので、PM の指示があるときだけ行う
 
 ## 2. フロントエンドのビルド
 
@@ -65,7 +65,7 @@ npx vite --port 5173 --host 127.0.0.1 > "$W/vite.log" 2>&1 &   # /api・/uploads
 curl -sf http://127.0.0.1:8000/api/health && curl -sf -o /dev/null http://127.0.0.1:5173/
 ```
 
-8000 / 5173 が使用中なら、既に動いているものを止めずに Deroshi に確認する（vite のプロキシ先は 8000 固定）。
+8000 / 5173 が使用中なら、既に動いているものを止めずに PM に確認する（vite のプロキシ先は 8000 固定）。
 
 ### 3-3. 撮影する
 

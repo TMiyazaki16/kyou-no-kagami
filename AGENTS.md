@@ -205,16 +205,16 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 
 ## 開発フロー
 
-2026-11-23 から Issue ドリブンで進める。Deroshi（PM）が条件を決め、Claude が Issue 起票 → ブランチで実装 → PR 作成、Deroshi がレビューしてマージし、デプロイは CI/CD が行う。セッションは 1 Issue = 1 セッションを基本にし、引き継ぎは会話ではなく Issue・PR・このファイル・レポートで行う。
+2026-11-23 から Issue ドリブンで進める。PM が条件を決め、Claude が Issue 起票 → ブランチで実装 → PR 作成、PM がレビューしてマージし、デプロイは CI/CD が行う。セッションは 1 Issue = 1 セッションを基本にし、引き継ぎは会話ではなく Issue・PR・このファイル・レポートで行う。
 
 ### 運用ルール
 
-- Issue は Deroshi の条件提示を受けて Claude が起票する。テンプレ必須項目：**背景 / スコープ / 受け入れ条件 / 対象外**
-- 大きな Issue（上の「人間確認が必要なとき」に当たるもの、3 ファイル以上にまたがるもの）は、実装前に Deroshi が内容を確認する。小さいタスクのバッチは起票→実装を通してよい
+- Issue は PM の条件提示を受けて Claude が起票する。テンプレ必須項目：**背景 / スコープ / 受け入れ条件 / 対象外**
+- 大きな Issue（上の「人間確認が必要なとき」に当たるもの、3 ファイル以上にまたがるもの）は、実装前に PM が内容を確認する。小さいタスクのバッチは起票→実装を通してよい
 - ブランチ命名：`<リポジトリ名（小文字）>-i<番号>-<タイトルを英訳したスラッグ>`（例：`kyou-no-kagami-i12-enlarge-record-buttons`）。main から切る。1 Issue = 1 ブランチ = 1 PR
 - **main への直接 push 禁止。必ず PR を作る**
-- PR 本文に `Closes #<番号>` とテスト・ビルド結果を書く。**マージは Deroshi**（レビュー通過後）。Claude はマージしない
-- push と PR 作成は、Deroshi に依頼されたときに `open-pr` の手順で行う（上の「明示依頼なしでは実行しない」は変わらない）
+- PR 本文に `Closes #<番号>` とテスト・ビルド結果を書く。**マージは PM**（レビュー通過後）。Claude はマージしない
+- push と PR 作成は、PM に依頼されたときに `open-pr` の手順で行う（上の「明示依頼なしでは実行しない」は変わらない）
 - GCP の手動操作はしない。デプロイは CI 経由（main へのマージで `.github/workflows/ci-cd.yml` が動く）。Terraform apply は従来どおり plan → オーナーの OK → apply のゲートを維持する（インフラリポジトリ側）
 - **`.github/workflows` は変更しない**（PAT に Workflows 権限は付けていない。ワークフローの変更はオーナーの手だけ）
 
@@ -226,7 +226,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | `start-issue` | Issue 番号 → 命名規則どおりのブランチを main から作成 |
 | `open-pr` | 検品 → commit → push → PR 作成（`Closes #<番号>`・テスト結果つき）。マージはしない |
 | `verify-app` | バックエンドテスト＋フロントビルド＋Playwright（Python）の画面確認＋不変条件の照合 |
-| `code-review` | PR 番号 → 差分・Issue・CI を照合した構造化レビュー。マージ判断は Deroshi |
+| `code-review` | PR 番号 → 差分・Issue・CI を照合した構造化レビュー。マージ判断は PM |
 
 スキル本体は汎用に書いてあり、リポジトリ固有の値は下の表から読む。値が変わったら表だけを直す。
 
@@ -237,7 +237,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 | リポジトリ | `TMiyazaki16/kyou-no-kagami` |
 | ブランチ接頭辞 | `kyou-no-kagami` |
 | 既定ブランチ | `main` |
-| gh | `~/workspace/tools/gh/gh`（Deroshi の VM。PATH に `gh` があればそれでよい） |
+| gh | `~/workspace/tools/gh/gh`（PM の VM。PATH に `gh` があればそれでよい） |
 | 検証スキル | `verify-app` |
 | テスト | `cd backend && env -u GEMINI_API_KEY .venv/bin/python -m unittest discover -s tests -v` |
 | テストの期待値 | `Ran 179 tests` / `OK (skipped=1)`（2026-11-25 時点、#39 後。skip は MySQL 実機検査）。テストを足したら更新する |
