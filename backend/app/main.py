@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from . import analysis as analysis_mod
 from . import auth
 from . import uploads
-from .storage import DuplicateError, Store, create_store
+from .storage import AlreadySentError, DuplicateError, Store, create_store
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.environ.get("APP_UPLOAD_DIR") or os.path.join(BASE_DIR, "..", "data", "uploads")
@@ -46,7 +46,8 @@ upload_storage.mount(app)
 STAMPS = ["いいね", "ありがとう", "うれしい", "元気そうで安心", "電話するね", "また聞かせて"]
 REPLY_MAX_CHARS = 200
 
-PLACEHOLDER_DRAFT = "（AI下書きはまだありません。記録すると、ここに下書きができます）"
+# 便りに添える本人のコメント（任意。空でも送れる）の上限。返信と同じ長さにそろえる
+COMMENT_MAX_CHARS = 200
 
 # H-6: MIME 許可リストから拡張子を決める（利用者のファイル名は使わない。定義は uploads.py）
 PHOTO_MIMES = uploads.PHOTO_MIMES
@@ -525,20 +526,16 @@ def weekly(user_id: str = Depends(_uid)):
 
 
 # --------------------------------------------------------------------------
-# Sharing （家族への共有 / 届いた便り） — opt-in only, editable draft, stamps
+# Sharing （家族への共有 / 家族の日記） — opt-in only
+# 便りの中身は「その日の AI フィードバック（今日の一言＋観察）の引用」＋「本人のコメント」（#35）。
+# 引用は送信時点のスナップショットで、だれも編集できない。本人が書けるのはコメントだけ。
+# 生の記録（2問の回答・文字起こし）は便りに入れない。
 # --------------------------------------------------------------------------
 
-class DraftIn(BaseModel):
-    record_id: int | None = None
-    to_user: str | None = None   # 連携相手が1人なら省略可
-
-
-class EditIn(BaseModel):
-    final_text: str
-
-
-class SendIn(BaseModel):
-    final_text: str | None = None
+class ShareIn(BaseModel):
+    record_id: int
+    to_users: list[str] = []      # 届ける家族（連携中の相手。複数可。宛先ごとに別の便りになる）
+    comment: str = ""             # 本人のコメント（任意）
     include_photo: bool = False   # 「写真も一緒に届ける」。既定は届けない（本人がオンにしたときだけ）
 
 
@@ -566,14 +563,27 @@ def _unique_stamps(stamps: list[dict]) -> list[dict]:
     return out
 
 
+def _load_snapshot(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        snap = json.loads(raw)
+    except ValueError:
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
 def _with_names(share: dict) -> dict:
     """便り・リアクション・返信に表示名を付ける（フロントが相手の名前を出すため）。
 
+    feedback は送信時点のフィードバックの引用（旧版の便りは null で、本文は final_text）。
     写真は保存先の参照（photo_path）を出さず、本人が「写真も一緒に届ける」を選んで送った便りだけ公開URLを付ける。
     """
     share = dict(share)
     share["from_name"] = _display_name(share["from_user"])
     share["to_name"] = _display_name(share["to_user"])
+    share["feedback"] = _load_snapshot(share.pop("snapshot_json", None))
+    share["comment"] = share.get("comment") or ""
     photo = share.pop("photo_path", None)
     share["photo_url"] = uploads.public_url(photo) if share.get("status") == "sent" and photo else None
     if "stamps" in share:
@@ -584,123 +594,80 @@ def _with_names(share: dict) -> dict:
     return share
 
 
-def _with_record_photo(share: dict, user_id: str) -> dict:
-    """書いた本人向け（下書き・送信の応答）：もとの記録に写真があれば、その公開URLを付ける（トグルの表示用）。"""
-    out = _with_names(share)
-    rec = store.get_record(share["record_id"]) if share.get("record_id") else None
-    photo = rec.get("photo_path") if rec and rec["user_id"] == user_id else None
-    out["record_photo_url"] = uploads.public_url(photo) if photo else None
-    return out
+def _feedback_snapshot(rec: dict) -> dict | None:
+    """その日（記録）の AI フィードバックの引用。今日の一言と観察を、そのままの文で写し取る。
+
+    記録を上書きしてまだ解析し直していない日・一言の代わりに案内文が出た日（voice_notice）は None（共有できない）。
+    回答・文字起こしそのものは入れない。
+    """
+    ana = _current_analysis(rec)
+    if not ana or ana.get("kind") != "word" or not (ana.get("todays_word") or "").strip():
+        return None
+    return {
+        "date": rec["date"],
+        "todays_word": ana["todays_word"],
+        "observations": [o for o in (ana.get("observations") or []) if isinstance(o, str) and o.strip()],
+    }
 
 
-def _pick_recipient(user_id: str, to_user: str | None) -> str:
-    family = [f["id"] for f in store.list_family(user_id)]
-    if to_user:
-        if to_user not in family:
-            raise HTTPException(403, "連携している家族にだけ送れます。設定で家族コードを入れて連携してください")
-        return to_user
+NO_FEEDBACK_MESSAGE = "この日は、まだ鏡の言葉（今日の一言）がありません。今日の一言ができた日を選んでください"
+
+
+@app.get("/api/shares/preview")
+def share_preview(record_id: int, user_id: str = Depends(_uid)):
+    """共有画面用：選んだ日（自分の記録）のフィードバックの引用と、届けられる家族（送信済みかどうか）。"""
+    rec = _owned_record(record_id, user_id)
+    feedback = _feedback_snapshot(rec)
+    already = set(store.sent_recipients(user_id, rec["id"]))
+    photo = rec.get("photo_path")
+    return {
+        "record_id": rec["id"],
+        "date": rec["date"],
+        "feedback": feedback,
+        "unavailable": "" if feedback else NO_FEEDBACK_MESSAGE,
+        "record_photo_url": uploads.public_url(photo) if photo else None,
+        "recipients": [{**f, "already_sent": f["id"] in already} for f in store.list_family(user_id)],
+    }
+
+
+def _names(user_ids: list[str]) -> str:
+    return "・".join(_display_name(u) for u in user_ids)
+
+
+@app.post("/api/shares")
+def send_letters(body: ShareIn, user_id: str = Depends(_uid)):
+    """選んだ日のフィードバックの引用＋コメントを、選んだ家族それぞれに1通ずつ届ける。
+
+    同じ日（記録）の便りは、同じ相手には1回だけ（取り消した便りは数えない）。1人でも送信済みなら、だれにも送らない。
+    """
+    rec = _owned_record(body.record_id, user_id)
+    to_users = list(dict.fromkeys(u for u in body.to_users if u))
+    family = {f["id"] for f in store.list_family(user_id)}
     if not family:
         raise HTTPException(400, "まだ家族と連携していません。設定で家族コードを入れると、便りを送れるようになります")
-    if len(family) > 1:
-        raise HTTPException(400, "送る相手を選んでください")
-    return family[0]
-
-
-def _owned_draft(share_id: int, user_id: str) -> dict:
-    share = store.get_share(share_id)
-    if not share:
-        raise HTTPException(404, "share not found")
-    if share["from_user"] != user_id:
-        raise HTTPException(403, "この下書きを編集・送信できるのは、書いた本人だけです")
-    if share["status"] != "draft":
-        raise HTTPException(409, "この便りはもう送信済みのため、変更できません")
-    return share
-
-
-def _is_sendable(text: str) -> bool:
-    t = (text or "").strip()
-    return bool(t) and t != PLACEHOLDER_DRAFT and not t.startswith("（AI下書きはまだありません")
-
-
-def _draft_label(rec_date: str | None) -> str:
-    """下書きの見出し。今日の記録は「今日の一言」、それ以外の日は「11月20日の一言」。"""
-    if not rec_date or rec_date == today_jst().isoformat():
-        return "今日の一言"
-    try:
-        d = date.fromisoformat(rec_date)
-    except ValueError:
-        return "今日の一言"
-    return f"{d.month}月{d.day}日の一言"
-
-
-@app.post("/api/shares/draft")
-def create_draft(body: DraftIn, user_id: str = Depends(_uid)):
-    """record_id を指定すると、その日（自分の記録）の一言から下書きを作る。省略時は最新の解析から。"""
-    ana = None
-    rec = None
-    if body.record_id:
-        rec = store.get_record(body.record_id)
-        if not rec:
-            raise HTTPException(404, "record not found")
-        if rec["user_id"] != user_id:
-            raise HTTPException(403, "自分の記録だけを共有できます")
-        # 選んだ記録に一言が無い（または上書き後でまだ作っていない）ときも、別の日の一言には差し替えない
-        ana = _current_analysis(rec)
-    to_user = _pick_recipient(user_id, body.to_user)
-    if rec is None:
-        ana = store.latest_analysis(user_id)
-    word = ana["todays_word"] if ana else None
-    rec_date = rec["date"] if rec else (ana["date"] if ana else None)
-    draft = f"{_draft_label(rec_date)}：{word}" if word else PLACEHOLDER_DRAFT
-    share = store.create_share({
-        "from_user": user_id,
-        "to_user": to_user,
-        # L-8: 実際に使った解析の記録IDに揃える（記録を選んだときはその記録）
-        "record_id": rec["id"] if rec else (ana["record_id"] if ana else None),
-        "draft_text": draft,
-    })
-    return _with_record_photo(share, user_id)
-
-
-@app.delete("/api/shares/{share_id}")
-def discard_draft(share_id: int, user_id: str = Depends(_uid)):
-    """自分の下書き（送っていないもの）を保存せずに破棄する。送信済みの便りはここでは消せない。"""
-    share = store.get_share(share_id)
-    if not share:
-        raise HTTPException(404, "share not found")
-    if share["from_user"] != user_id:
-        raise HTTPException(403, "この下書きを破棄できるのは、書いた本人だけです")
-    if share["status"] != "draft":
-        raise HTTPException(409, "送信済みの便りは、ここでは消せません。家族の日記から取り消してください")
-    store.delete_share(share_id)
-    return {"ok": True, "deleted": share_id}
-
-
-@app.patch("/api/shares/{share_id}")
-def edit_share(share_id: int, body: EditIn, user_id: str = Depends(_uid)):
-    _owned_draft(share_id, user_id)
-    return _with_record_photo(store.update_share(share_id, {"final_text": body.final_text}), user_id)
-
-
-@app.post("/api/shares/{share_id}/send")
-def send_share(share_id: int, body: SendIn, user_id: str = Depends(_uid)):
-    share = _owned_draft(share_id, user_id)
-    if not store.are_linked(user_id, share["to_user"]):
-        raise HTTPException(403, "この相手とは連携が解除されています。設定で連携してから送ってください")
-    text = body.final_text if body.final_text is not None else share["final_text"]
-    if not _is_sendable(text):
-        raise HTTPException(400, "送る内容が空か、下書きの案内文のままです。ひとこと書いてから送ってください。")
+    if not to_users:
+        raise HTTPException(400, "届ける家族を選んでください")
+    if any(u not in family for u in to_users):
+        raise HTTPException(403, "連携している家族にだけ送れます。設定で家族コードを入れて連携してください")
+    comment = (body.comment or "").strip()
+    if len(comment) > COMMENT_MAX_CHARS:
+        raise HTTPException(400, f"コメントは{COMMENT_MAX_CHARS}字までです（いま{len(comment)}字）")
+    feedback = _feedback_snapshot(rec)
+    if feedback is None:
+        raise HTTPException(400, NO_FEEDBACK_MESSAGE)
     # 写真は本人が「写真も一緒に届ける」を選んだときだけ、送った時点の記録の写真を便りに写し取る
     # （あとで同じ日の記録を撮り直しても、届いた便りの写真は送ったときのまま）
-    photo = None
-    if body.include_photo and share.get("record_id"):
-        rec = store.get_record(share["record_id"])
-        if rec and rec["user_id"] == user_id:
-            photo = rec.get("photo_path") or None
-    return _with_record_photo(store.update_share(share_id, {
-        "final_text": text.strip(), "status": "sent",
-        "sent_at": datetime.now(timezone.utc).isoformat(), "photo_path": photo,
-    }), user_id)
+    photo = (rec.get("photo_path") or None) if body.include_photo else None
+    try:
+        letters = store.create_letters(user_id, rec["id"], to_users, {
+            "snapshot_json": json.dumps(feedback, ensure_ascii=False),
+            "comment": comment,
+            "photo_path": photo,
+        })
+    except AlreadySentError as e:
+        raise HTTPException(409, f"{_names(e.to_users)}には、この日の便りをもう送っています。"
+                                 "送り直すときは、家族の日記で前の便りを取り消してから送ってください") from None
+    return {"letters": [_with_names(l) for l in letters]}
 
 
 @app.get("/api/letters")

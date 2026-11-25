@@ -28,6 +28,7 @@ MySQL の --reset は全テーブルを空にするので、--confirm-mysql-rese
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from datetime import date, datetime, time, timedelta
@@ -131,15 +132,16 @@ def main() -> int:
 
     if args.with_letter:
         rec7 = store.find_record("mother", (start + timedelta(days=6)).isoformat())
-        share = store.create_share({
-            "from_user": "mother", "to_user": "daughter", "record_id": rec7["id"] if rec7 else None,
-            "draft_text": "今日は友だちと電話で昔話をして、たくさん笑いました。",
-        })
-        store.update_share(share["id"], {
-            "status": "sent",
-            "sent_at": datetime.combine(start + timedelta(days=6), time(20, 0),
-                                        tzinfo=app_main.JST).isoformat(),
-        })
+        # 便りは「その日のフィードバックの引用（送信時点で固定）＋本人のコメント」（API の POST /api/shares と同じ形）
+        feedback = app_main._feedback_snapshot(rec7) if rec7 else None
+        if feedback:
+            store.create_letters("mother", rec7["id"], ["daughter"], {
+                "snapshot_json": json.dumps(feedback, ensure_ascii=False),
+                "comment": "友だちと電話で昔話をして、たくさん笑ったよ。",
+                "photo_path": None,
+                "sent_at": datetime.combine(start + timedelta(days=6), time(20, 0),
+                                            tzinfo=app_main.JST).isoformat(),
+            })
 
     print(f"\n投入しました: {target}（{start} 〜 {end}、{n}日分）")
     for acc in auth.DEMO_ACCOUNTS:

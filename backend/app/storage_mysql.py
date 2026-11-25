@@ -29,7 +29,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from .storage import GEMINI_SCOPE_GLOBAL, DuplicateError, Store, _analysis_row, _now, gemini_user_scope
+from .storage import GEMINI_SCOPE_GLOBAL, AlreadySentError, DuplicateError, Store, _analysis_row, _now, gemini_user_scope
 
 _ER_DUP_ENTRY = 1062
 _TABLE_OPTS = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
@@ -76,6 +76,8 @@ MYSQL_SCHEMA = [
     created_at VARCHAR(40) NOT NULL,
     sent_at VARCHAR(40) NULL,
     photo_path VARCHAR(512) NULL,
+    snapshot_json MEDIUMTEXT NULL,
+    comment TEXT NULL,
     KEY idx_shares_from (from_user, status),
     KEY idx_shares_to (to_user, status)
 ) {_TABLE_OPTS}""",
@@ -139,6 +141,8 @@ _MYSQL_ANALYSIS_EXTRA_COLUMNS = {
 # storage._SHARE_EXTRA_COLUMNS の MySQL 版
 _MYSQL_SHARE_EXTRA_COLUMNS = {
     "photo_path": "VARCHAR(512) NULL",
+    "snapshot_json": "MEDIUMTEXT NULL",   # NULL は旧版の便り
+    "comment": "TEXT NULL",               # TEXT にリテラル DEFAULT を付けられないので NULL 可（アプリが必ず渡す）
 }
 
 APP_TABLES = ("letter_replies", "stamps", "shares", "analyses", "records", "family_links", "sessions", "users",
@@ -463,29 +467,41 @@ class MySQLStore(Store):
         return _analysis_row(row) if row else None
 
     # ---- shares / stamps -------------------------------------------------
-    def create_share(self, share: dict) -> dict:
-        with self._conn() as cur:
+    def create_letters(self, from_user: str, record_id: int, to_users: list[str], letter: dict) -> list[dict]:
+        now = _now()
+        sent_at = letter.get("sent_at") or now   # seed_demo.py が過去の日付で作るときだけ指定する
+        with self._conn() as cur:   # 1つの接続＝1トランザクションで、判定と作成をまとめる
+            marks = ", ".join("%s" for _ in to_users)
+            # FOR UPDATE：同じ送り手の便りの行（索引 idx_shares_from の範囲）をロックし、同時の二重送信を直列にする
             cur.execute(
-                "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at, sent_at)"
-                " VALUES (%s, %s, %s, %s, %s, 'draft', %s, NULL)",
-                (share["from_user"], share["to_user"], share.get("record_id"),
-                 share.get("draft_text", ""), share.get("draft_text", ""), _now()),
-            )
-            cur.execute("SELECT * FROM shares WHERE id = %s", (cur.lastrowid,))
-            return cur.fetchone()
+                f"SELECT to_user FROM shares WHERE from_user = %s AND status = 'sent' AND record_id = %s"
+                f" AND to_user IN ({marks}) FOR UPDATE", (from_user, record_id, *to_users))
+            dup = sorted({r["to_user"] for r in cur.fetchall()})
+            if dup:
+                raise AlreadySentError(dup)
+            ids = []
+            for to_user in to_users:
+                cur.execute(
+                    "INSERT INTO shares (from_user, to_user, record_id, draft_text, final_text, status, created_at,"
+                    " sent_at, photo_path, snapshot_json, comment)"
+                    " VALUES (%s, %s, %s, '', %s, 'sent', %s, %s, %s, %s, %s)",
+                    (from_user, to_user, record_id, letter.get("comment", ""), now, sent_at,
+                     letter.get("photo_path"), letter["snapshot_json"], letter.get("comment", "")),
+                )
+                ids.append(cur.lastrowid)
+            out = []
+            for i in ids:
+                cur.execute("SELECT * FROM shares WHERE id = %s", (i,))
+                out.append(cur.fetchone())
+            return out
+
+    def sent_recipients(self, from_user: str, record_id: int) -> list[str]:
+        rows = self._all("SELECT DISTINCT to_user FROM shares WHERE from_user = %s AND status = 'sent'"
+                         " AND record_id = %s", (from_user, record_id))
+        return [r["to_user"] for r in rows]
 
     def get_share(self, share_id: int) -> dict | None:
         return self._one("SELECT * FROM shares WHERE id = %s", (share_id,))
-
-    def update_share(self, share_id: int, fields: dict) -> dict | None:
-        allowed = {"final_text", "status", "sent_at", "photo_path"}
-        sets = {k: v for k, v in fields.items() if k in allowed}
-        if not sets:
-            return self.get_share(share_id)
-        clause = ", ".join(f"{k} = %s" for k in sets)
-        with self._conn() as cur:
-            cur.execute(f"UPDATE shares SET {clause} WHERE id = %s", (*sets.values(), share_id))
-        return self.get_share(share_id)
 
     def delete_share(self, share_id: int) -> bool:
         with self._conn() as cur:   # 1つの接続＝1トランザクションで、反応・返信ごと消す
