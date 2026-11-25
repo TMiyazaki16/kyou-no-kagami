@@ -205,7 +205,7 @@ cd backend && KAGAMI_TEST_MYSQL=1 MYSQL_HOST=127.0.0.1 MYSQL_USER=... MYSQL_PASS
 
 ## 開発フロー
 
-2026-11-23 から Issue ドリブンで進める。PMが条件を決め、Claude が Issue 起票 → ブランチで実装 → PR 作成、PM がレビューしてマージし、デプロイは CI/CD が行う。セッションは 1 Issue = 1 セッションを基本にし、引き継ぎは会話ではなく Issue・PR・このファイル・レポートで行う。
+2026-11-23 から Issue ドリブンで進める。PM が条件を決め、Claude が Issue 起票 → ブランチで実装 → PR 作成、PM がレビューしてマージし、デプロイは CI/CD が行う。セッションは 1 Issue = 1 セッションを基本にし、引き継ぎは会話ではなく Issue・PR・このファイル・レポートで行う。
 
 ### 運用ルール
 
