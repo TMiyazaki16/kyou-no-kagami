@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, COMMENT_MAX_CHARS, RecordItem, SharePreview } from "../api";
 import { charCount, errText, localDateStr } from "../lib/format";
 import { FeedbackQuote } from "../components/FeedbackQuote";
@@ -24,8 +24,24 @@ function recordLabel(r: RecordItem, today: string): string {
 /* 引用は書きかえられない。回答そのもの（2問の答え・声）は届かない。          */
 /* 選んだ家族それぞれに、別々の便りとして届く。同じ日を同じ人に送るのは1回だけ。 */
 /* ------------------------------------------------------------------ */
-export function ShareConfirm({ family, go, openDiary }: Ctx) {
-  // どの日の記録を共有するか。初期は今日の記録（なければ最新の記録）
+export function ShareConfirm({
+  family,
+  go,
+  openDiary,
+  initialRecordId,
+  onInitialUsed,
+}: Ctx & {
+  /** 最初に選ぶ記録（記録一覧の「⋯」から開いたとき）。無ければ今日、なければ最新 */
+  initialRecordId?: number | null;
+  /** initialRecordId を受け取ったら呼ぶ（App 側の値を消して、一度だけにする） */
+  onInitialUsed?: () => void;
+}) {
+  // 開いた時点の指定だけを使う（App 側の値はすぐ消えるので、ここで持っておく）
+  const initial = useRef(initialRecordId ?? null);
+  useEffect(() => {
+    if (initialRecordId != null) onInitialUsed?.();
+  }, [initialRecordId, onInitialUsed]);
+  // どの日の記録を共有するか。初期は指定の記録、なければ今日の記録（なければ最新の記録）
   const [records, setRecords] = useState<RecordItem[] | null>(null);
   const [recordId, setRecordId] = useState<number | null>(null);
   const [preview, setPreview] = useState<SharePreview | null>(null);
@@ -43,8 +59,9 @@ export function ShareConfirm({ family, go, openDiary }: Ctx) {
       .records()
       .then((rs) => {
         setRecords(rs);
-        // 一覧は新しい日付順。今日の記録があればそれ、なければ最新
-        setRecordId((rs.find((r) => r.date === today) ?? rs[0])?.id ?? null);
+        // 一覧は新しい日付順。指定の記録があればそれ、なければ今日の記録、なければ最新
+        const picked = rs.find((r) => r.id === initial.current) ?? rs.find((r) => r.date === today) ?? rs[0];
+        setRecordId(picked?.id ?? null);
       })
       .catch(() => setRecords([]));
   }, [today]);

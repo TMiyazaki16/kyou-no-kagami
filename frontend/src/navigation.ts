@@ -38,6 +38,8 @@ export interface Ctx {
   go: (s: Screen) => void;
   /** 「家族の日記」へ移り、指定の便りを強調する（通知の行・送信の直後） */
   openDiary: (focus: DiaryFocus) => void;
+  /** 「家族への共有」へ移り、指定の記録（日）を選んだ状態で開く（記録一覧の「⋯」メニューから） */
+  openShare: (recordId: number) => void;
   refreshMe: () => Promise<void>;
 }
 
